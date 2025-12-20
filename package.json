@@ -1,7 +1,7 @@
 {
-  "name": "react-native-offline-queue",
+  "name": "react-native-sync-vault",
   "version": "1.0.0",
-  "description": "A reliable, persistent network operation queue for React Native",
+  "description": "A reliable offline-first sync vault for persistent network operations in React Native",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "scripts": {

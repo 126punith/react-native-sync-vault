@@ -180,7 +180,7 @@ class QueueManager {
       if (!NativeModule) {
         throw new Error(
           'Native module not available. The offline queue requires the native module to persist requests. ' +
-          'Please ensure react-native-offline-queue native module is properly linked and the app is rebuilt.'
+          'Please ensure react-native-sync-vault native module is properly linked and the app is rebuilt.'
         );
       }
       

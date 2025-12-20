@@ -1,5 +1,5 @@
 /**
- * react-native-offline-queue
+ * react-native-sync-vault
  * Main entry point for the library
  */
 

@@ -1,6 +1,6 @@
 # Performance Benchmarks
 
-This document tracks performance metrics for react-native-offline-queue.
+This document tracks performance metrics for react-native-sync-vault.
 
 ## Target Metrics
 
@@ -40,7 +40,7 @@ This document tracks performance metrics for react-native-offline-queue.
 Performance metrics are tracked automatically and can be accessed via:
 
 ```typescript
-import { performanceTracker } from 'react-native-offline-queue';
+import { performanceTracker } from 'react-native-sync-vault';
 
 const metrics = await performanceTracker.getMetrics();
 console.log('Initialization time:', metrics.initializationTime);

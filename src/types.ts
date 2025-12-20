@@ -1,5 +1,5 @@
 /**
- * Core TypeScript definitions for react-native-offline-queue
+ * Core TypeScript definitions for react-native-sync-vault
  */
 
 export type RequestStatus = 'pending' | 'syncing' | 'synced' | 'failed' | 'conflict';

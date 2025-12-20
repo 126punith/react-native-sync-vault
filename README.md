@@ -1,6 +1,6 @@
-# react-native-offline-queue
+# react-native-sync-vault
 
-A reliable, persistent network operation queue for React Native. Queue API requests offline, persist them in SQLite, and progressively sync when online. Failed requests are never lost.
+A reliable offline-first sync vault for persistent network operations in React Native. Queue API requests offline, persist them in SQLite, and progressively sync when online. Failed requests are never lost.
 
 ## What it is NOT
 
@@ -19,9 +19,9 @@ A reliable, persistent network operation queue for React Native. Queue API reque
 ## Installation
 
 ```bash
-npm install react-native-offline-queue
+npm install react-native-sync-vault
 # or
-yarn add react-native-offline-queue
+yarn add react-native-sync-vault
 ```
 
 ### iOS Setup
@@ -65,7 +65,7 @@ The library automatically detects when your device goes offline or comes back on
 ### Basic Usage
 
 ```typescript
-import { useOfflineQueue } from 'react-native-offline-queue';
+import { useOfflineQueue } from 'react-native-sync-vault';
 
 function MyComponent() {
   const queue = useOfflineQueue('https://api.example.com');
@@ -95,7 +95,7 @@ function MyComponent() {
 By default, the library uses `fetch()` to make API calls. You can provide your own API call handler to use axios, custom fetch wrappers, or any other HTTP client:
 
 ```typescript
-import { useOfflineQueue, ApiCallHandler, ApiCallResponse } from 'react-native-offline-queue';
+import { useOfflineQueue, ApiCallHandler, ApiCallResponse } from 'react-native-sync-vault';
 import axios from 'axios';
 
 function MyComponent() {
@@ -163,7 +163,7 @@ function MyComponent() {
 ### Using Custom Fetch Wrapper
 
 ```typescript
-import { useOfflineQueue, ApiCallHandler } from 'react-native-offline-queue';
+import { useOfflineQueue, ApiCallHandler } from 'react-native-sync-vault';
 
 // Your custom fetch wrapper
 async function customFetch(url: string, options: RequestInit) {
@@ -212,7 +212,7 @@ import {
   useQueueStatus,
   usePendingRequests,
   useFailedRequests,
-} from 'react-native-offline-queue';
+} from 'react-native-sync-vault';
 
 function QueueStatus() {
   const { status, loading } = useQueueStatus();
@@ -470,7 +470,7 @@ See [benchmarks/performance.md](benchmarks/performance.md) for detailed metrics.
 Visual debugger for queue status:
 
 ```typescript
-import { DebugScreen } from 'react-native-offline-queue';
+import { DebugScreen } from 'react-native-sync-vault';
 
 function App() {
   return (
@@ -487,7 +487,7 @@ function App() {
 Structured logging for development:
 
 ```typescript
-import { QueueLogger } from 'react-native-offline-queue';
+import { QueueLogger } from 'react-native-sync-vault';
 
 QueueLogger.info('Request queued', { requestId: '123' });
 QueueLogger.error('Sync failed', { error: 'Network error' });
@@ -526,7 +526,7 @@ await queue.sync();
 ### Performance Metrics
 
 ```typescript
-import { performanceTracker } from 'react-native-offline-queue';
+import { performanceTracker } from 'react-native-sync-vault';
 
 const metrics = await performanceTracker.getMetrics();
 console.log('Initialization time:', metrics.initializationTime);
@@ -538,11 +538,11 @@ console.log('Average sync time:', metrics.averageSyncTime);
 
 The library categorizes errors automatically:
 
-- **Network errors**: Retryable with exponential backoff
-- **Server errors (5xx)**: Retryable
+- **Network errors**: Retirable with exponential backoff
+- **Server errors (5xx)**: Retirable
 - **Client errors (4xx)**: Conditional retry (validation errors are permanent)
 - **Conflicts (409)**: Special handling based on resolution strategy
-- **Timeouts**: Retryable
+- **Timeouts**: Retirable
 
 ## Turbo Module Migration
 
