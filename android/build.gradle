@@ -1,0 +1,50 @@
+buildscript {
+    ext {
+        buildToolsVersion = "33.0.0"
+        minSdkVersion = 21
+        compileSdkVersion = 33
+        targetSdkVersion = 33
+        ndkVersion = "23.1.7779620"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:7.4.2")
+    }
+}
+
+apply plugin: "com.android.library"
+
+android {
+    compileSdkVersion rootProject.ext.compileSdkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    lintOptions {
+        disable 'GradleCompatible'
+    }
+}
+
+repositories {
+    mavenCentral()
+    google()
+    maven { url "https://www.jitpack.io" }
+}
+
+dependencies {
+    implementation "com.facebook.react:react-native:+"
+    implementation "com.github.ospfranco:react-native-nitro-sqlite:1.0.0"
+}
+

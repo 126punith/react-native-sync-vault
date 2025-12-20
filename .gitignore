@@ -1,0 +1,16 @@
+node_modules/
+lib/
+*.log
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+build/
+dist/
+coverage/
+*.tsbuildinfo
+
+
