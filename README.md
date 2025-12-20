@@ -2,6 +2,8 @@
 
 A reliable offline-first sync vault for persistent network operations in React Native. Queue API requests offline, persist them in SQLite, and progressively sync when online. Failed requests are never lost.
 
+📹 **Demo Video**: [Watch on YouTube](https://www.youtube.com/watch?v=Gs1bcV6Zw3k)
+
 ## What it is NOT
 
 - ❌ A full-featured database with relationships (like WatermelonDB)
