@@ -166,11 +166,20 @@ export interface ApiCallRequest {
 export type ApiCallHandler = (request: ApiCallRequest) => Promise<ApiCallResponse>;
 
 /**
+ * Configuration for automatic API interception
+ */
+export interface InterceptorConfig {
+  enabled?: boolean;                    // Opt-in flag
+  urlFilter?: string[];                 // Simple allow list (URLs must start with these)
+}
+
+/**
  * Configuration options for offline queue
  */
 export interface OfflineQueueConfig {
   apiCallHandler?: ApiCallHandler;
   baseUrl?: string;
+  interceptor?: InterceptorConfig;      // Automatic API interception config
 }
 
 

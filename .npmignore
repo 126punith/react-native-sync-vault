@@ -1,0 +1,40 @@
+# Source files
+src/
+__tests__/
+
+# Development files
+tsconfig.json
+jest.config.js
+.gitignore
+.eslintrc*
+.prettierrc*
+
+# Build artifacts (keep lib/ for published package)
+*.tsbuildinfo
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test and coverage
+coverage/
+*.log
+
+# Documentation (keep README.md)
+benchmarks/
+
+# Development dependencies
+node_modules/
+
+# Build directories
+build/
+dist/
+
+# Temporary files
+*.tmp
+*.temp
+
+

@@ -106,8 +106,24 @@ export function useOfflineQueue(baseUrlOrConfig?: string | OfflineQueueConfig) {
       }
     }
 
+    // Enable automatic API interception if configured
+    if (config.interceptor?.enabled && queueManagerRef.current) {
+      try {
+        queueManagerRef.current.enableAutoInterception(config.interceptor);
+      } catch (error) {
+        console.error('Failed to enable auto interception:', error);
+      }
+    }
+
     return () => {
       // Cleanup on unmount
+      if (queueManagerRef.current) {
+        try {
+          queueManagerRef.current.disableAutoInterception();
+        } catch (error) {
+          console.error('Failed to disable auto interception:', error);
+        }
+      }
       if (syncEngineRef.current) {
         try {
           syncEngineRef.current.stopSync();
@@ -116,7 +132,7 @@ export function useOfflineQueue(baseUrlOrConfig?: string | OfflineQueueConfig) {
         }
       }
     };
-  }, [baseUrl, apiCallHandler]);
+  }, [baseUrl, apiCallHandler, config.interceptor]);
 
   /**
    * Push a request to the queue

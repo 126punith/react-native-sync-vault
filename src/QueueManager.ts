@@ -4,6 +4,7 @@ import {
   QueuePushOptions,
   RequestStatus,
   SyncDataPoint,
+  InterceptorConfig,
 } from './types';
 import { generateRequestId } from './utils/idGenerator';
 import { performanceTracker } from './utils/performance';
@@ -49,6 +50,7 @@ try {
 class QueueManager {
   private networkMonitor: any;
   private isInitialized: boolean = false;
+  private apiInterceptor: any = null;
 
   constructor() {
     try {
@@ -160,7 +162,7 @@ class QueueManager {
     // Build request object - native module expects 'id' and 'requestId' fields
     const request: any = {
       id: id, // Primary ID for the request
-      requestId: options.id || options.url + '_' + now, // Deduplication key
+      requestId: options.url + '_' + now, // Deduplication key
       method: options.method.toUpperCase(),
       url: options.url,
       headers: options.headers || {},
@@ -219,7 +221,7 @@ class QueueManager {
           } else {
             console.log('[DEBUG] QueueManager.push() network is offline (after refresh), not triggering sync');
           }
-        }).catch((error) => {
+        }).catch((error: any) => {
           console.warn('[DEBUG] QueueManager.push() error refreshing network status:', error);
           // Fall back to checking current status
           if (this.networkMonitor.isOnline()) {
@@ -351,9 +353,42 @@ class QueueManager {
   }
 
   /**
+   * Enable automatic API interception
+   */
+  enableAutoInterception(config: InterceptorConfig): void {
+    if (!config.enabled) {
+      return;
+    }
+
+    try {
+      if (!this.apiInterceptor) {
+        const ApiInterceptorClass = require('./ApiInterceptor').default;
+        this.apiInterceptor = new ApiInterceptorClass();
+      }
+      this.apiInterceptor.enable(config, this);
+    } catch (error) {
+      console.error('Failed to enable auto interception:', error);
+    }
+  }
+
+  /**
+   * Disable automatic API interception
+   */
+  disableAutoInterception(): void {
+    if (this.apiInterceptor) {
+      try {
+        this.apiInterceptor.disable();
+      } catch (error) {
+        console.error('Failed to disable auto interception:', error);
+      }
+    }
+  }
+
+  /**
    * Cleanup resources
    */
   destroy(): void {
+    this.disableAutoInterception();
     this.networkMonitor.destroy();
   }
 }
@@ -372,6 +407,8 @@ try {
     getFailedRequests: async () => [],
     updateRequestStatus: async () => {},
     triggerSync: async () => {},
+    enableAutoInterception: () => {},
+    disableAutoInterception: () => {},
     getNetworkMonitor: () => ({
       getStatus: () => 'unknown' as const,
       isOnline: () => false,

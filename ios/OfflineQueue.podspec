@@ -9,11 +9,11 @@ Pod::Spec.new do |s|
   s.description  = <<-DESC
                   A reliable offline-first sync vault for persistent network operations in React Native
                    DESC
-  s.homepage     = "https://github.com/yourusername/react-native-sync-vault"
+  s.homepage     = "https://github.com/126punith/react-native-sync-vault"
   s.license      = "MIT"
-  s.author       = { "author" => "author@example.com" }
+  s.author       = { "Punith M" => "punithm300@gmail.com" }
   s.platforms    = { :ios => "11.0" }
-  s.source       = { :git => "https://github.com/yourusername/react-native-sync-vault.git", :tag => "#{s.version}" }
+  s.source       = { :git => "https://github.com/126punith/react-native-sync-vault.git", :tag => "#{s.version}" }
 
   s.source_files = "ios/**/*.{h,m,mm,swift}"
   s.requires_arc = true

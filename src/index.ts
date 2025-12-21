@@ -120,6 +120,17 @@ try {
 export { DebugScreenExport as DebugScreen };
 export { QueueLoggerExport as QueueLogger };
 
+// Export ApiInterceptor
+let ApiInterceptorExport: any;
+try {
+  ApiInterceptorExport = require('./ApiInterceptor').default;
+} catch (error) {
+  console.error('Failed to load ApiInterceptor:', error);
+  ApiInterceptorExport = null;
+}
+
+export { ApiInterceptorExport as ApiInterceptor };
+
 // Default export - main queue instance
 export default OfflineQueueExport;
 

@@ -2,7 +2,22 @@
 
 A reliable offline-first sync vault for persistent network operations in React Native. Queue API requests offline, persist them in SQLite, and progressively sync when online. Failed requests are never lost.
 
+**NEW in v1.2.0**: Automatic API interception - automatically intercepts `fetch()` calls and queues them when offline! No code changes needed.
+
 📹 **Demo Video**: [Watch on YouTube](https://www.youtube.com/watch?v=Gs1bcV6Zw3k)
+
+## Changelog
+
+### v1.1.0 (Latest)
+- ✨ **NEW**: Automatic API interception - intercepts `fetch()` calls automatically
+- ✨ **NEW**: URL filtering for selective interception
+- 🐛 Fixed dependency array issue in `useOfflineQueue` hook
+- 📝 Enhanced debug logging for troubleshooting
+
+### v1.0.0
+- Initial release with manual queuing support
+- Native network monitoring
+- Progressive sync engine
 
 ## What it is NOT
 
@@ -17,6 +32,7 @@ A reliable offline-first sync vault for persistent network operations in React N
 - ✅ Progressive sync engine
 - ✅ Failure persistence and retry logic
 - ✅ Custom native network monitoring (no external dependencies)
+- ✅ **Automatic API interception** - Automatically intercepts `fetch()` calls and queues them when offline
 
 ## Installation
 
@@ -25,6 +41,21 @@ npm install react-native-sync-vault
 # or
 yarn add react-native-sync-vault
 ```
+
+### Dependencies
+
+The package requires the following peer dependencies (usually already installed in React Native projects):
+
+```bash
+# React and React Native (peer dependencies)
+# These should already be in your project, but if not:
+npm install react react-native
+
+# The package uses react-native-nitro-sqlite for SQLite operations
+# This is automatically installed as a dependency
+```
+
+**Note:** Make sure you have React Native 0.60+ for autolinking to work properly.
 
 ### iOS Setup
 
@@ -62,9 +93,28 @@ This library uses **custom native network monitoring** instead of third-party de
 
 The library automatically detects when your device goes offline or comes back online and handles request queuing and syncing accordingly. No manual network status checking is required.
 
+## Automatic API Interception (NEW!)
+
+**The package now automatically intercepts `fetch()` calls!** When enabled, all `fetch()` calls are automatically intercepted and queued when the device is offline. No need to manually call `queue.push()` for every API call!
+
+### Features
+
+- ✅ **Zero-configuration**: Just enable it and all `fetch()` calls are automatically handled
+- ✅ **URL filtering**: Only intercept requests to specific URLs (optional)
+- ✅ **Automatic queuing**: Requests are queued when offline, executed when online
+- ✅ **Seamless integration**: Works with existing code - no changes needed to your API calls
+
+### How It Works
+
+1. Enable automatic interception in your `useOfflineQueue` config
+2. All `fetch()` calls are automatically intercepted
+3. When offline: Requests are queued and return status 202 (Queued)
+4. When online: Requests execute normally
+5. Queued requests sync automatically when network is restored
+
 ## Quick Start
 
-### Basic Usage
+### Basic Usage (Manual Queuing)
 
 ```typescript
 import { useOfflineQueue } from 'react-native-sync-vault';
@@ -91,6 +141,62 @@ function MyComponent() {
   );
 }
 ```
+
+### Automatic Interception (Recommended)
+
+**NEW!** Enable automatic `fetch()` interception - no need to manually queue requests:
+
+```typescript
+import { useOfflineQueue } from 'react-native-sync-vault';
+
+function MyComponent() {
+  // Enable automatic interception
+  const queue = useOfflineQueue({
+    baseUrl: 'https://api.example.com',
+    interceptor: {
+      enabled: true,
+      urlFilter: ['https://api.example.com'], // Optional: only intercept these URLs
+    },
+  });
+
+  const handleSubmit = async () => {
+    // Just use fetch() normally - it's automatically intercepted!
+    try {
+      const response = await fetch('https://api.example.com/api/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          name: 'John Doe', 
+          email: 'john@example.com' 
+        }),
+      });
+
+      if (response.status === 202) {
+        // Request was queued (device is offline)
+        console.log('Request queued for offline sync');
+      } else {
+        // Request executed normally (device is online)
+        const data = await response.json();
+        console.log('Request successful:', data);
+      }
+    } catch (error) {
+      console.error('Request failed:', error);
+    }
+  };
+
+  return (
+    <Button onPress={handleSubmit} title="Submit" />
+  );
+}
+```
+
+**Benefits:**
+- ✅ No code changes needed - use `fetch()` as usual
+- ✅ Automatic offline handling
+- ✅ Works with existing API code
+- ✅ Optional URL filtering for selective interception
 
 ### Using Custom API Call Handler
 
@@ -248,6 +354,12 @@ function QueueStatus() {
   interface OfflineQueueConfig {
     baseUrl?: string;
     apiCallHandler?: ApiCallHandler;
+    interceptor?: InterceptorConfig;  // NEW: Automatic API interception
+  }
+
+  interface InterceptorConfig {
+    enabled?: boolean;      // Enable automatic fetch() interception
+    urlFilter?: string[];   // Optional: Only intercept URLs starting with these strings
   }
   ```
 
@@ -271,6 +383,15 @@ const queue = useOfflineQueue('https://api.example.com');
 const queue = useOfflineQueue({
   baseUrl: 'https://api.example.com',
   apiCallHandler: myCustomHandler,
+});
+
+// With automatic interception enabled
+const queue = useOfflineQueue({
+  baseUrl: 'https://api.example.com',
+  interceptor: {
+    enabled: true,
+    urlFilter: ['https://api.example.com'], // Optional
+  },
 });
 ```
 
@@ -500,6 +621,70 @@ const errors = QueueLogger.getLogsByLevel('error');
 ```
 
 ## Advanced Usage
+
+### Automatic API Interception
+
+The automatic interception feature allows you to use `fetch()` normally while the library handles offline queuing automatically.
+
+#### Basic Setup
+
+```typescript
+const queue = useOfflineQueue({
+  baseUrl: 'https://api.example.com',
+  interceptor: {
+    enabled: true,
+  },
+});
+
+// Now all fetch() calls are automatically intercepted
+await fetch('https://api.example.com/users');
+```
+
+#### URL Filtering
+
+Only intercept specific URLs:
+
+```typescript
+const queue = useOfflineQueue({
+  baseUrl: 'https://api.example.com',
+  interceptor: {
+    enabled: true,
+    urlFilter: [
+      'https://api.example.com',
+      'https://cdn.example.com',
+    ],
+  },
+});
+
+// This will be intercepted
+await fetch('https://api.example.com/users');
+
+// This will NOT be intercepted (not in filter)
+await fetch('https://other-api.com/data');
+```
+
+#### Behavior
+
+- **When Online**: `fetch()` executes normally, returns actual response
+- **When Offline**: `fetch()` is queued, returns status 202 with `{ queued: true }` response
+- **When Back Online**: Queued requests sync automatically
+
+#### Response Handling
+
+```typescript
+const response = await fetch('https://api.example.com/users');
+
+if (response.status === 202) {
+  // Request was queued (offline)
+  const data = await response.json();
+  console.log('Queued:', data.queued); // true
+  console.log('Request ID:', data.requestId);
+} else {
+  // Request executed normally (online)
+  const data = await response.json();
+  console.log('Data:', data);
+}
+```
 
 ### Network Status Monitoring
 

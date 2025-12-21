@@ -23,8 +23,8 @@ class NetworkMonitor extends EventEmitter {
   private eventSubscription: any = null;
 
   constructor() {
+    super();
     try {
-      super();
       console.log('[DEBUG] NetworkMonitor constructor entry, hasNativeModule:', !!NativeModule);
       // Initialize asynchronously to avoid blocking module load
       this.initialize().catch((error) => {
