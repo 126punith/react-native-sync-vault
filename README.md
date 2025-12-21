@@ -2,7 +2,7 @@
 
 A reliable offline-first sync vault for persistent network operations in React Native. Queue API requests offline, persist them in SQLite, and progressively sync when online. Failed requests are never lost.
 
-**NEW in v1.2.0**: Automatic API interception - automatically intercepts `fetch()` calls and queues them when offline! No code changes needed.
+**NEW in v1.1.0**: Automatic API interception - automatically intercepts `fetch()` calls and queues them when offline! No code changes needed.
 
 📹 **Demo Video**: [Watch on YouTube](https://www.youtube.com/watch?v=Gs1bcV6Zw3k)
 
