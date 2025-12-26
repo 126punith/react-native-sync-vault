@@ -17,11 +17,10 @@ import { QueueLogger } from './QueueLogger';
  * Debug screen component for visualizing queue status
  */
 export function DebugScreen() {
-  // Disable polling in DebugScreen to avoid duplicate calls (App.tsx already polls)
-  // Use refetch manually via refresh control instead
-  const { status, refetch: refetchStatus } = useQueueStatus(0);
-  const { pendingRequests, refetch: refetchPending } = usePendingRequests(20, 0);
-  const { failedRequests, refetch: refetchFailed, retry } = useFailedRequests(0);
+  // Use event-based hooks (no polling)
+  const { status, refetch: refetchStatus } = useQueueStatus();
+  const { pendingRequests, refetch: refetchPending } = usePendingRequests(20);
+  const { failedRequests, refetch: refetchFailed, retry } = useFailedRequests();
   const [metrics, setMetrics] = useState<any>(null);
   const [logs, setLogs] = useState<any[]>([]);
   const [refreshing, setRefreshing] = useState(false);

@@ -4,6 +4,7 @@
 #import <sqlite3.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <netinet/in.h>
+#import <UIKit/UIKit.h>
 
 // Reachability callback function
 static void ReachabilityCallback(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags flags, void* info) {
@@ -576,9 +577,65 @@ RCT_EXPORT_METHOD(getNetworkStatus:(RCTPromiseResolveBlock)resolve
     }
 }
 
+// Battery monitoring
+RCT_EXPORT_METHOD(getBatteryLevel:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    @try {
+        UIDevice *device = [UIDevice currentDevice];
+        device.batteryMonitoringEnabled = YES;
+        float batteryLevel = device.batteryLevel;
+        
+        if (batteryLevel < 0) {
+            // Battery level not available
+            resolve(@(100)); // Default to 100% if unavailable
+        } else {
+            resolve(@((int)(batteryLevel * 100)));
+        }
+    } @catch (NSException *exception) {
+        reject(@"BATTERY_ERROR", exception.reason, nil);
+    }
+}
+
+RCT_EXPORT_METHOD(isBatteryCharging:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    @try {
+        UIDevice *device = [UIDevice currentDevice];
+        device.batteryMonitoringEnabled = YES;
+        UIDeviceBatteryState batteryState = device.batteryState;
+        
+        BOOL isCharging = (batteryState == UIDeviceBatteryStateCharging || 
+                          batteryState == UIDeviceBatteryStateFull);
+        resolve(@(isCharging));
+    } @catch (NSException *exception) {
+        reject(@"BATTERY_ERROR", exception.reason, nil);
+    }
+}
+
+// Network quality (stub - can be enhanced with actual bandwidth testing)
+RCT_EXPORT_METHOD(getNetworkType:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    @try {
+        // For now, return unknown - can be enhanced with actual network type detection
+        resolve(@"unknown");
+    } @catch (NSException *exception) {
+        reject(@"NETWORK_ERROR", exception.reason, nil);
+    }
+}
+
+RCT_EXPORT_METHOD(getNetworkBandwidth:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    @try {
+        // Stub - return 0 to indicate unknown
+        // Can be enhanced with actual bandwidth testing
+        resolve(@(0));
+    } @catch (NSException *exception) {
+        reject(@"NETWORK_ERROR", exception.reason, nil);
+    }
+}
+
 // Required for RCTEventEmitter
 - (NSArray<NSString *> *)supportedEvents {
-    return @[@"networkStatusChanged"];
+    return @[@"networkStatusChanged", @"BatteryLevelChanged"];
 }
 
 @end

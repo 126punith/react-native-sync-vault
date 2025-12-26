@@ -1,4 +1,3 @@
-import { NativeModules } from 'react-native';
 import {
   QueuedRequest,
   QueuePushOptions,
@@ -8,104 +7,73 @@ import {
 } from './types';
 import { generateRequestId } from './utils/idGenerator';
 import { performanceTracker } from './utils/performance';
+import { getNativeModule } from './utils/nativeModule';
+import { EventEmitter } from './utils/EventEmitter';
 
 // Lazy import NetworkMonitor to avoid evaluation errors
 let NetworkMonitorClass: any = null;
 function getNetworkMonitorClass() {
   if (!NetworkMonitorClass) {
     try {
-      console.log('[DEBUG] getNetworkMonitorClass: Attempting to require NetworkMonitor');
       const networkMonitorModule = require('./NetworkMonitor');
-      console.log('[DEBUG] getNetworkMonitorClass: Module loaded, has default:', !!networkMonitorModule.default);
       NetworkMonitorClass = networkMonitorModule.default;
-      console.log('[DEBUG] getNetworkMonitorClass: NetworkMonitorClass extracted:', !!NetworkMonitorClass);
     } catch (error) {
-      console.error('[DEBUG] getNetworkMonitorClass: Error loading NetworkMonitor:', error);
-      console.warn('Failed to load NetworkMonitor class:', error);
+      if (__DEV__) {
+        console.warn('Failed to load NetworkMonitor class:', error);
+      }
       return null;
     }
   }
   return NetworkMonitorClass;
 }
 
-// Get native module with error handling
-let NativeModule: any = null;
-let nativeModuleWarningShown = false;
-try {
-  NativeModule = NativeModules.OfflineQueue;
-  if (!NativeModule && !nativeModuleWarningShown) {
-    console.warn('OfflineQueue native module not found. Some features may not work.');
-    nativeModuleWarningShown = true;
-  }
-} catch (error) {
-  if (!nativeModuleWarningShown) {
-    console.warn('Failed to access native module:', error);
-    nativeModuleWarningShown = true;
-  }
-}
+// Get native module
+const NativeModule = getNativeModule();
 
 /**
  * Queue Manager - Main class for managing offline request queue
  */
-class QueueManager {
+class QueueManager extends EventEmitter {
   private networkMonitor: any;
   private isInitialized: boolean = false;
   private apiInterceptor: any = null;
+  private axiosInterceptor: any = null;
 
   constructor() {
+    super(); // Call EventEmitter constructor
     try {
-      console.log('[DEBUG] QueueManager constructor: Attempting to load NetworkMonitor');
       const NetworkMonitorClass = getNetworkMonitorClass();
-      console.log('[DEBUG] QueueManager constructor: NetworkMonitorClass loaded:', !!NetworkMonitorClass);
       if (NetworkMonitorClass) {
-        console.log('[DEBUG] QueueManager constructor: Creating NetworkMonitor instance');
         this.networkMonitor = new NetworkMonitorClass();
-        console.log('[DEBUG] QueueManager constructor: NetworkMonitor created successfully, status:', this.networkMonitor.getStatus());
       } else {
         throw new Error('NetworkMonitor class not available');
       }
     } catch (error) {
-      console.error('[DEBUG] QueueManager constructor: Failed to create NetworkMonitor:', error);
-      console.warn('Failed to create NetworkMonitor, using stub with native fallback:', error);
-      // Create a stub NetworkMonitor that checks native module directly
+      if (__DEV__) {
+        console.warn('Failed to create NetworkMonitor, using stub:', error);
+      }
+      // Create a simple stub NetworkMonitor
       let stubStatus: 'online' | 'offline' | 'unknown' = 'unknown';
       this.networkMonitor = {
         _lastStatus: 'unknown',
         getStatus: () => stubStatus,
-        isOnline: () => {
-          // Stub returns false - will be updated by refreshStatus if native module works
-          return false;
-        },
-        isOffline: () => {
-          // Stub returns true - will be updated by refreshStatus if native module works
-          return true;
-        },
+        isOnline: () => false,
+        isOffline: () => true,
         refreshStatus: async () => {
-          try {
-            if (NativeModule) {
-              // Try calling getNetworkStatus even if it's not enumerable
-              // React Native methods might exist but not be enumerable
-              try {
-                const status = await NativeModule.getNetworkStatus();
-                console.log('[DEBUG] Stub NetworkMonitor.refreshStatus() got status from native:', status);
-                // Update the stub's status
-                if (status === 'online') {
-                  stubStatus = 'online';
-                } else if (status === 'offline') {
-                  stubStatus = 'offline';
-                } else {
-                  stubStatus = 'unknown';
-                }
-                this.networkMonitor._lastStatus = stubStatus;
-                console.log('[DEBUG] Stub NetworkMonitor.refreshStatus() updated stubStatus to:', stubStatus);
-                return;
-              } catch (e) {
-                // Method might not exist, but try anyway
-                console.warn('[DEBUG] Stub NetworkMonitor.refreshStatus() getNetworkStatus call failed:', e);
+          if (NativeModule) {
+            try {
+              const status = await NativeModule.getNetworkStatus();
+              if (status === 'online') {
+                stubStatus = 'online';
+              } else if (status === 'offline') {
+                stubStatus = 'offline';
+              } else {
+                stubStatus = 'unknown';
               }
+              this.networkMonitor._lastStatus = stubStatus;
+            } catch (e) {
+              // Method might not exist
             }
-          } catch (e) {
-            console.warn('[DEBUG] Stub NetworkMonitor.refreshStatus() error:', e);
           }
         },
         destroy: () => {},
@@ -115,7 +83,6 @@ class QueueManager {
         removeAllListeners: () => this.networkMonitor,
         listenerCount: () => 0,
       } as any;
-      console.log('[DEBUG] QueueManager constructor: Using stub NetworkMonitor with native fallback');
     }
   }
 
@@ -137,7 +104,9 @@ class QueueManager {
           // Sync status will be initialized by database schema
         }
       } catch (error) {
-        console.warn('Failed to get sync status during initialization:', error);
+        if (__DEV__) {
+          console.warn('Failed to get sync status during initialization:', error);
+        }
       }
     } else {
       // Warning already shown at module load, no need to repeat
@@ -201,42 +170,50 @@ class QueueManager {
           };
           await NativeModule.insertDataPoint(dataPoint);
         } catch (error) {
-          console.warn('Failed to insert data point:', error);
+          if (__DEV__) {
+            console.warn('Failed to insert data point:', error);
+          }
         }
       }
 
       // Update sync status
       await this.updateSyncStatusCounters();
 
+      // Emit event for new request
+      this.emit('queue:request:added', { requestId: id, request });
+      
+      if (__DEV__) {
+        console.log('[EVENT] Emitting queue:request:added:', { 
+          requestId: id, 
+          method: request.method, 
+          url: request.url 
+        });
+      }
+
       // If online, trigger immediate sync attempt (non-blocking)
       // Try to refresh status first if it's unknown and refreshStatus is available
       if (this.networkMonitor.getStatus() === 'unknown' && typeof this.networkMonitor.refreshStatus === 'function') {
         this.networkMonitor.refreshStatus().then(() => {
-          const isOnline = this.networkMonitor.isOnline();
-          if (isOnline) {
-            console.log('[DEBUG] QueueManager.push() network is online (after refresh), triggering sync');
+          if (this.networkMonitor.isOnline()) {
             this.triggerSync().catch((error) => {
-              console.warn('Failed to trigger immediate sync:', error);
+              if (__DEV__) {
+                console.warn('Failed to trigger immediate sync:', error);
+              }
             });
-          } else {
-            console.log('[DEBUG] QueueManager.push() network is offline (after refresh), not triggering sync');
           }
-        }).catch((error: any) => {
-          console.warn('[DEBUG] QueueManager.push() error refreshing network status:', error);
+        }).catch(() => {
           // Fall back to checking current status
           if (this.networkMonitor.isOnline()) {
-            this.triggerSync().catch((err) => console.warn('Failed to trigger sync:', err));
+            this.triggerSync().catch(() => {});
           }
         });
       } else {
-        const isOnline = this.networkMonitor.isOnline();
-        if (isOnline) {
-          console.log('[DEBUG] QueueManager.push() network is online, triggering sync');
+        if (this.networkMonitor.isOnline()) {
           this.triggerSync().catch((error) => {
-            console.warn('Failed to trigger immediate sync:', error);
+            if (__DEV__) {
+              console.warn('Failed to trigger immediate sync:', error);
+            }
           });
-        } else {
-          console.log('[DEBUG] QueueManager.push() network is offline, not triggering sync');
         }
       }
 
@@ -294,6 +271,24 @@ class QueueManager {
     }
     try {
       await NativeModule.updateRequestStatus(requestId, status, data || {});
+      
+      // Emit request status change events
+      if (__DEV__) {
+        console.log('[EVENT] Emitting queue:status:changed:', { requestId, status });
+      }
+      
+      if (status === 'synced') {
+        this.emit('queue:request:synced', { requestId, data });
+        if (__DEV__) {
+          console.log('[EVENT] Emitting queue:request:synced:', { requestId });
+        }
+      } else if (status === 'failed') {
+        this.emit('queue:request:failed', { requestId, data });
+        if (__DEV__) {
+          console.log('[EVENT] Emitting queue:request:failed:', { requestId });
+        }
+      }
+      
       await this.updateSyncStatusCounters();
     } catch (error) {
       console.error('Failed to update request status:', error);
@@ -313,13 +308,27 @@ class QueueManager {
       const pending = await this.getPendingRequests(1000, 0);
       const failed = await this.getFailedRequests();
 
-      await NativeModule.updateSyncStatus({
+      const status = {
         totalPending: pending.length,
         totalFailed: failed.length,
         networkStatus: this.networkMonitor.getStatus(),
-      });
+      };
+
+      await NativeModule.updateSyncStatus(status);
+
+      // Emit status change event
+      this.emit('queue:status:changed', status);
+      this.emit('queue:pending:changed', pending);
+      this.emit('queue:failed:changed', failed);
+      
+      if (__DEV__) {
+        console.log('[EVENT] Emitting queue:pending:changed:', { count: pending.length });
+        console.log('[EVENT] Emitting queue:failed:changed:', { count: failed.length });
+      }
     } catch (error) {
-      console.warn('Failed to update sync status counters:', error);
+      if (__DEV__) {
+        console.warn('Failed to update sync status counters:', error);
+      }
     }
   }
 
@@ -356,18 +365,45 @@ class QueueManager {
    * Enable automatic API interception
    */
   enableAutoInterception(config: InterceptorConfig): void {
-    if (!config.enabled) {
-      return;
+    if (__DEV__) {
+      console.log('[AUTO-DETECT] Enabling auto-interception:', { 
+        fetch: config.enabled || false,
+        axios: config.axios?.enabled || false 
+      });
+    }
+    
+    // Enable fetch interception
+    if (config.enabled) {
+      try {
+        if (!this.apiInterceptor) {
+          const ApiInterceptorClass = require('./ApiInterceptor').default;
+          this.apiInterceptor = new ApiInterceptorClass();
+        }
+        this.apiInterceptor.enable(config, this);
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Failed to enable fetch interception:', error);
+        }
+      }
     }
 
-    try {
-      if (!this.apiInterceptor) {
-        const ApiInterceptorClass = require('./ApiInterceptor').default;
-        this.apiInterceptor = new ApiInterceptorClass();
+    // Enable axios interception
+    if (config.axios?.enabled) {
+      try {
+        if (!this.axiosInterceptor) {
+          const AxiosInterceptorClass = require('./AxiosInterceptor').default;
+          this.axiosInterceptor = new AxiosInterceptorClass();
+        }
+        this.axiosInterceptor.enable(config, this, config.axios.instance);
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Failed to enable axios interception:', error);
+        }
       }
-      this.apiInterceptor.enable(config, this);
-    } catch (error) {
-      console.error('Failed to enable auto interception:', error);
+    }
+    
+    if (__DEV__) {
+      console.log('[AUTO-DETECT] Auto-interception enabled successfully');
     }
   }
 
@@ -379,7 +415,18 @@ class QueueManager {
       try {
         this.apiInterceptor.disable();
       } catch (error) {
-        console.error('Failed to disable auto interception:', error);
+        if (__DEV__) {
+          console.error('Failed to disable fetch interception:', error);
+        }
+      }
+    }
+    if (this.axiosInterceptor) {
+      try {
+        this.axiosInterceptor.disable();
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Failed to disable axios interception:', error);
+        }
       }
     }
   }
@@ -390,6 +437,7 @@ class QueueManager {
   destroy(): void {
     this.disableAutoInterception();
     this.networkMonitor.destroy();
+    this.removeAllListeners();
   }
 }
 
@@ -398,7 +446,9 @@ let queueManager: QueueManager;
 try {
   queueManager = new QueueManager();
 } catch (error) {
-  console.error('Failed to create QueueManager singleton, using stub:', error);
+  if (__DEV__) {
+    console.error('Failed to create QueueManager singleton, using stub:', error);
+  }
   // Create a stub QueueManager to prevent module export failure
   queueManager = {
     initialize: async () => {},

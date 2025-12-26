@@ -4,10 +4,10 @@ import QueueManager from '../QueueManager';
 
 /**
  * Hook for getting pending requests
+ * Uses event listeners instead of polling for reactive updates
  * @param limit - Maximum number of requests to fetch. Default: 10
- * @param pollInterval - Polling interval in milliseconds. Set to 0 to disable polling. Default: 5000ms
  */
-export function usePendingRequests(limit: number = 10, pollInterval: number = 5000) {
+export function usePendingRequests(limit: number = 10) {
   const [pendingRequests, setPendingRequests] = useState<QueuedRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -26,14 +26,30 @@ export function usePendingRequests(limit: number = 10, pollInterval: number = 50
   }, [limit]);
 
   useEffect(() => {
+    // Initial fetch
     fetchPendingRequests();
 
-    // Only poll if interval is greater than 0
-    if (pollInterval > 0) {
-      const interval = setInterval(fetchPendingRequests, pollInterval);
-      return () => clearInterval(interval);
+    // Listen to pending requests change events
+    const handlePendingChange = (newPendingRequests: QueuedRequest[]) => {
+      // Limit the requests to the specified limit
+      const limitedRequests = newPendingRequests.slice(0, limit);
+      setPendingRequests(limitedRequests);
+      setError(null);
+    };
+
+    // Subscribe to events
+    if (QueueManager && typeof QueueManager.on === 'function') {
+      QueueManager.on('queue:pending:changed', handlePendingChange);
+      QueueManager.on('queue:request:added', fetchPendingRequests);
+      QueueManager.on('queue:request:synced', fetchPendingRequests);
+      
+      return () => {
+        QueueManager.off('queue:pending:changed', handlePendingChange);
+        QueueManager.off('queue:request:added', fetchPendingRequests);
+        QueueManager.off('queue:request:synced', fetchPendingRequests);
+      };
     }
-  }, [fetchPendingRequests, pollInterval]);
+  }, [fetchPendingRequests, limit]);
 
   return {
     pendingRequests,

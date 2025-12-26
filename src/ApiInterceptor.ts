@@ -13,21 +13,20 @@ class ApiInterceptor {
    * Enable automatic API interception
    */
   enable(config: InterceptorConfig, queueManager: any): void {
-    console.log('[DEBUG] ApiInterceptor.enable() called', {
-      isEnabled: this.isEnabled,
-      configEnabled: config.enabled,
-      urlFilter: config.urlFilter,
-      hasQueueManager: !!queueManager,
-    });
-
     if (this.isEnabled) {
-      console.log('[DEBUG] ApiInterceptor.enable() already enabled, skipping');
       return; // Already enabled, idempotent
     }
 
     if (!config.enabled) {
-      console.log('[DEBUG] ApiInterceptor.enable() config.enabled is false, skipping');
       return; // Not enabled in config
+    }
+
+    // Verify global.fetch exists
+    if (typeof global.fetch !== 'function') {
+      if (__DEV__) {
+        console.error('ApiInterceptor: global.fetch is not a function');
+      }
+      return;
     }
 
     // Store original fetch before overriding
@@ -37,8 +36,14 @@ class ApiInterceptor {
     this.queueManager = queueManager;
 
     // Override global fetch
-    global.fetch = this.interceptedFetch.bind(this);
-    console.log('[DEBUG] ApiInterceptor.enable() fetch() overridden successfully');
+    const interceptedFetch = this.interceptedFetch.bind(this);
+    global.fetch = interceptedFetch;
+    
+    if (__DEV__) {
+      console.log('[INTERCEPTOR-FETCH] Enabled fetch interception with filters:', { 
+        urlFilter: config.urlFilter || [] 
+      });
+    }
   }
 
   /**
@@ -54,6 +59,17 @@ class ApiInterceptor {
     this.isEnabled = false;
     this.originalFetch = null;
     this.queueManager = null;
+    
+    if (__DEV__) {
+      console.log('[INTERCEPTOR-FETCH] Disabled fetch interception');
+    }
+  }
+
+  /**
+   * Verify interceptor is active (for testing)
+   */
+  isActive(): boolean {
+    return this.isEnabled && global.fetch === this.interceptedFetch.bind(this);
   }
 
   /**
@@ -63,13 +79,6 @@ class ApiInterceptor {
     url: RequestInfo | URL,
     options?: RequestInit
   ): Promise<Response> {
-    console.log('[DEBUG] ApiInterceptor.interceptedFetch() called', {
-      url: typeof url === 'string' ? url : url instanceof URL ? url.toString() : 'Request object',
-      method: options?.method || 'GET',
-      isEnabled: this.isEnabled,
-      hasQueueManager: !!this.queueManager,
-    });
-
     // Convert URL to string
     let urlString: string;
     let requestOptions: RequestInit | undefined = options;
@@ -101,16 +110,22 @@ class ApiInterceptor {
     }
 
     // Check URL filter - if filter exists and URL doesn't match, execute normally
+    const method = requestOptions?.method || 'GET';
+    if (__DEV__) {
+      console.log('[INTERCEPTOR-FETCH] Intercepting request:', { method, url: urlString });
+    }
+    
     if (this.urlFilter && this.urlFilter.length > 0) {
       const matchesFilter = this.urlFilter.some(filter => urlString.startsWith(filter));
-      console.log('[DEBUG] ApiInterceptor URL filter check', {
-        urlString,
-        urlFilter: this.urlFilter,
-        matchesFilter,
-      });
+      if (__DEV__) {
+        console.log('[INTERCEPTOR-FETCH] URL filter check:', { 
+          matchesFilter: matchesFilter ? 'MATCH' : 'NO_MATCH',
+          url: urlString,
+          filters: this.urlFilter 
+        });
+      }
       if (!matchesFilter) {
         // URL doesn't match filter, execute normally
-        console.log('[DEBUG] ApiInterceptor URL does not match filter, executing normally');
         return this.originalFetch!(url, requestOptions);
       }
     }
@@ -128,14 +143,15 @@ class ApiInterceptor {
     }
 
     const isOnline = networkMonitor.isOnline();
-    console.log('[DEBUG] ApiInterceptor network status', {
-      isOnline,
-      networkStatus: networkMonitor.getStatus(),
-    });
+    
+    if (__DEV__) {
+      console.log('[INTERCEPTOR-FETCH] Network status:', { 
+        isOnline: isOnline ? 'ONLINE' : 'OFFLINE' 
+      });
+    }
 
     // If offline, queue the request
     if (!isOnline) {
-      console.log('[DEBUG] ApiInterceptor device is offline, queuing request');
       try {
         // Extract method
         const method = requestOptions?.method || 'GET';
@@ -147,19 +163,16 @@ class ApiInterceptor {
         const bodyData = await this.parseBody(requestOptions?.body);
 
         // Queue the request
-        console.log('[DEBUG] ApiInterceptor queuing request', {
-          method,
-          url: urlString,
-          hasBody: !!bodyData,
-          headersCount: Object.keys(headers).length,
-        });
         const requestId = await this.queueManager.push({
           method,
           url: urlString,
           data: bodyData,
           headers,
         });
-        console.log('[DEBUG] ApiInterceptor request queued successfully', { requestId });
+
+        if (__DEV__) {
+          console.log('[INTERCEPTOR-FETCH] Request queued:', { requestId, method, url: urlString });
+        }
 
         // Return a mock response to avoid breaking existing code
         // Status 202 (Accepted) indicates the request was queued
@@ -173,7 +186,9 @@ class ApiInterceptor {
       } catch (error) {
         // If queuing fails, log error but still return a response
         // to avoid breaking the calling code
-        console.error('[ApiInterceptor] Failed to queue request:', error);
+        if (__DEV__) {
+          console.error('[INTERCEPTOR-FETCH] Failed to queue request:', error);
+        }
         return new Response(JSON.stringify({ 
           queued: false, 
           error: 'Failed to queue request',
@@ -189,7 +204,9 @@ class ApiInterceptor {
     }
 
     // Online: execute normally
-    console.log('[DEBUG] ApiInterceptor device is online, executing fetch normally');
+    if (__DEV__) {
+      console.log('[INTERCEPTOR-FETCH] Executing normally (online):', { method, url: urlString });
+    }
     return this.originalFetch!(url, requestOptions);
   }
 
@@ -203,7 +220,7 @@ class ApiInterceptor {
 
     if (headers instanceof Headers) {
       const result: Record<string, string> = {};
-      headers.forEach((value, key) => {
+      headers.forEach((value: string, key: string) => {
         result[key] = value;
       });
       return result;

@@ -169,8 +169,33 @@ export type ApiCallHandler = (request: ApiCallRequest) => Promise<ApiCallRespons
  * Configuration for automatic API interception
  */
 export interface InterceptorConfig {
-  enabled?: boolean;                    // Opt-in flag
+  enabled?: boolean;                    // Opt-in flag for fetch interception
   urlFilter?: string[];                 // Simple allow list (URLs must start with these)
+  axios?: {
+    enabled?: boolean;                   // Enable axios interception
+    instance?: any;                     // Custom axios instance (optional, uses default if not provided)
+  };
+}
+
+/**
+ * Resource-aware configuration
+ */
+export interface ResourceAwareConfig {
+  battery?: {
+    lowThreshold?: number; // Percentage (default: 20)
+    action?: 'defer_non_critical' | 'pause' | 'continue'; // Action when low
+    criticalOnly?: boolean; // Only sync critical items when low
+  };
+  network?: {
+    qualityAware?: boolean; // Detect network quality
+    deferLargeUploadsOnCellular?: boolean; // Defer large uploads on cellular
+    minQualityForLargeUploads?: 'unknown' | 'poor' | 'fair' | 'good' | 'excellent'; // Minimum quality
+    maxPayloadSizeOnCellular?: number; // Max payload size on cellular (bytes)
+  };
+  storage?: {
+    maxCacheSize?: number; // Max cache size in bytes
+    cleanupOnLowStorage?: boolean; // Cleanup when storage is low
+  };
 }
 
 /**
@@ -180,6 +205,70 @@ export interface OfflineQueueConfig {
   apiCallHandler?: ApiCallHandler;
   baseUrl?: string;
   interceptor?: InterceptorConfig;      // Automatic API interception config
+  cache?: CacheConfig;                  // Cache configuration
+  resourceAware?: ResourceAwareConfig;  // Resource-aware sync configuration
+}
+
+/**
+ * Cache entry stored in database
+ */
+export interface CacheEntry {
+  id: string;
+  key: string;                          // Cache key (usually URL)
+  value: string;                        // JSON stringified response
+  ttl: number;                          // Time to live (timestamp)
+  tags?: string;                        // Comma-separated tags for invalidation
+  createdAt: number;
+  updatedAt: number;
+  lastAccessedAt: number;               // For LRU eviction
+  size: number;                         // Size in bytes
+}
+
+/**
+ * Per-endpoint cache strategy
+ */
+export interface EndpointCacheStrategy {
+  ttl?: number;                        // TTL in seconds for this endpoint
+  staleWhileRevalidate?: boolean;      // Use stale-while-revalidate for this endpoint
+  strategy?: CacheStrategy;            // Override default strategy for this endpoint
+}
+
+/**
+ * Cache invalidation configuration
+ */
+export interface InvalidationConfig {
+  [mutationPattern: string]: string[]; // e.g., 'POST /api/assignments': ['/api/assignments', '/api/assignments/*']
+}
+
+/**
+ * Cache configuration
+ */
+export interface CacheConfig {
+  enabled?: boolean;                    // Enable caching
+  defaultTtl?: number;                  // Default TTL in seconds (default: 3600)
+  maxSize?: number;                     // Max cache size in bytes (default: 50MB)
+  strategy?: CacheStrategy;            // Cache strategy (default: 'network-first')
+  invalidateOnError?: boolean;         // Invalidate cache on error (default: false)
+  strategies?: Record<string, EndpointCacheStrategy>; // Per-endpoint strategies
+  invalidateOnMutate?: InvalidationConfig; // Invalidation rules for mutations
+}
+
+/**
+ * Cache strategy type
+ */
+export type CacheStrategy = 
+  | 'cache-first'                      // Check cache first, fallback to network
+  | 'network-first'                    // Try network first, fallback to cache
+  | 'stale-while-revalidate';          // Return cache immediately, refresh in background
+
+/**
+ * Cache result
+ */
+export interface CacheResult {
+  hit: boolean;                         // Whether cache hit
+  data?: any;                          // Cached data (if hit)
+  stale?: boolean;                     // Whether cache is stale
+  ttl?: number;                        // Remaining TTL
 }
 
 

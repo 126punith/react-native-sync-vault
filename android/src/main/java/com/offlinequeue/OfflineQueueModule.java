@@ -9,6 +9,9 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.os.BatteryManager;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.util.Log;
 
 import androidx.core.content.ContextCompat;
@@ -88,6 +91,8 @@ public class OfflineQueueModule extends ReactContextBaseJavaModule {
             
             try {
                 String[] paramArray = null;
+                // Handle empty arrays explicitly - React Native empty array [] becomes ReadableArray with size 0
+                boolean isEmptyArray = (params != null && params.size() == 0);
                 if (params != null && params.size() > 0) {
                     paramArray = new String[params.size()];
                     for (int i = 0; i < params.size(); i++) {
@@ -142,8 +147,13 @@ public class OfflineQueueModule extends ReactContextBaseJavaModule {
                     
                     promise.resolve(results);
                 } else {
-                    // INSERT/UPDATE/DELETE
-                    db.execSQL(query, paramArray);
+                    // INSERT/UPDATE/DELETE/CREATE TABLE
+                    // execSQL throws IllegalArgumentException if paramArray is empty array, so use single-arg version for empty/null
+                    if (isEmptyArray || (paramArray != null && paramArray.length == 0)) {
+                        db.execSQL(query);
+                    } else {
+                        db.execSQL(query, paramArray);
+                    }
                     long lastInsertRowId = -1;
                     if (query.trim().toUpperCase().startsWith("INSERT")) {
                         Cursor idCursor = db.rawQuery("SELECT last_insert_rowid()", null);
@@ -1033,6 +1043,76 @@ public class OfflineQueueModule extends ReactContextBaseJavaModule {
             Log.e(TAG, "Error converting JSONArray to ReadableArray", e);
         }
         return array;
+    }
+
+    // Battery monitoring
+    @ReactMethod
+    public void getBatteryLevel(Promise promise) {
+        try {
+            IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            Intent batteryStatus = getReactApplicationContext().registerReceiver(null, ifilter);
+            
+            if (batteryStatus != null) {
+                int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+                
+                if (level >= 0 && scale > 0) {
+                    int batteryPct = (int) ((level * 100) / (float) scale);
+                    promise.resolve(batteryPct);
+                } else {
+                    promise.resolve(100); // Default to 100% if unavailable
+                }
+            } else {
+                promise.resolve(100); // Default to 100% if unavailable
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error getting battery level", e);
+            promise.reject("BATTERY_ERROR", e.getMessage(), e);
+        }
+    }
+
+    @ReactMethod
+    public void isBatteryCharging(Promise promise) {
+        try {
+            IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            Intent batteryStatus = getReactApplicationContext().registerReceiver(null, ifilter);
+            
+            if (batteryStatus != null) {
+                int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                boolean isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                                    status == BatteryManager.BATTERY_STATUS_FULL;
+                promise.resolve(isCharging);
+            } else {
+                promise.resolve(false);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error checking battery charging status", e);
+            promise.reject("BATTERY_ERROR", e.getMessage(), e);
+        }
+    }
+
+    // Network quality (stub - can be enhanced with actual bandwidth testing)
+    @ReactMethod
+    public void getNetworkType(Promise promise) {
+        try {
+            // For now, return unknown - can be enhanced with actual network type detection
+            promise.resolve("unknown");
+        } catch (Exception e) {
+            Log.e(TAG, "Error getting network type", e);
+            promise.reject("NETWORK_ERROR", e.getMessage(), e);
+        }
+    }
+
+    @ReactMethod
+    public void getNetworkBandwidth(Promise promise) {
+        try {
+            // Stub - return 0 to indicate unknown
+            // Can be enhanced with actual bandwidth testing
+            promise.resolve(0);
+        } catch (Exception e) {
+            Log.e(TAG, "Error getting network bandwidth", e);
+            promise.reject("NETWORK_ERROR", e.getMessage(), e);
+        }
     }
 }
 

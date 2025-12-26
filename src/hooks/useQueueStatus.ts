@@ -13,9 +13,9 @@ try {
 
 /**
  * Hook for getting real-time queue status
- * @param pollInterval - Polling interval in milliseconds. Set to 0 to disable polling. Default: 5000ms
+ * Uses event listeners instead of polling for reactive updates
  */
-export function useQueueStatus(pollInterval: number = 5000) {
+export function useQueueStatus() {
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -49,14 +49,40 @@ export function useQueueStatus(pollInterval: number = 5000) {
   }, []);
 
   useEffect(() => {
+    // Initial fetch
     fetchStatus();
 
-    // Only poll if interval is greater than 0
-    if (pollInterval > 0) {
-      const interval = setInterval(fetchStatus, pollInterval);
-      return () => clearInterval(interval);
+    // Listen to status change events
+    const handleStatusChange = async (newStatus: any) => {
+      try {
+        if (!NativeModule) {
+          return;
+        }
+        
+        const syncStatus = await NativeModule.getSyncStatus();
+        const networkMonitor = QueueManager.getNetworkMonitor();
+        const networkStatus = networkMonitor.getStatus();
+        
+        setStatus({
+          ...syncStatus,
+          networkStatus,
+          ...newStatus,
+        } as SyncStatus);
+        setError(null);
+      } catch (err) {
+        setError(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
+    // Subscribe to events
+    if (QueueManager && typeof QueueManager.on === 'function') {
+      QueueManager.on('queue:status:changed', handleStatusChange);
+      
+      return () => {
+        QueueManager.off('queue:status:changed', handleStatusChange);
+      };
     }
-  }, [fetchStatus, pollInterval]);
+  }, [fetchStatus]);
 
   return {
     status,

@@ -1,17 +1,19 @@
-import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
+import { NativeEventEmitter, Platform } from 'react-native';
 import { NetworkStatus } from './types';
 import { EventEmitter } from './utils/EventEmitter';
+import { getNativeModule } from './utils/nativeModule';
 
-// Get native module with error handling
-let NativeModule: any = null;
+// Get native module
+const NativeModule = getNativeModule();
 let NativeEventEmitterInstance: NativeEventEmitter | null = null;
-try {
-  NativeModule = NativeModules.OfflineQueue;
-  if (NativeModule) {
+if (NativeModule) {
+  try {
     NativeEventEmitterInstance = new NativeEventEmitter(NativeModule);
+  } catch (error) {
+    if (__DEV__) {
+      console.warn('Failed to create NativeEventEmitter:', error);
+    }
   }
-} catch (error) {
-  console.warn('Failed to access native module in NetworkMonitor:', error);
 }
 
 /**
@@ -24,18 +26,22 @@ class NetworkMonitor extends EventEmitter {
 
   constructor() {
     super();
+    if (__DEV__) {
+      console.log('[AUTO-DETECT] NetworkMonitor initialized');
+    }
     try {
-      console.log('[DEBUG] NetworkMonitor constructor entry, hasNativeModule:', !!NativeModule);
       // Initialize asynchronously to avoid blocking module load
       this.initialize().catch((error) => {
-        console.error('[DEBUG] NetworkMonitor initialization failed:', error);
-        console.warn('NetworkMonitor initialization failed:', error);
+        if (__DEV__) {
+          console.warn('NetworkMonitor initialization failed:', error);
+        }
         // Set default status if initialization fails
         this.currentStatus = 'unknown';
       });
     } catch (error) {
-      console.error('[DEBUG] NetworkMonitor constructor error:', error);
-      console.error('NetworkMonitor constructor error:', error);
+      if (__DEV__) {
+        console.error('NetworkMonitor constructor error:', error);
+      }
       throw error;
     }
   }
@@ -45,54 +51,33 @@ class NetworkMonitor extends EventEmitter {
    */
   private async initialize(): Promise<void> {
     try {
-      const hasGetNetworkStatus = !!(NativeModule && typeof NativeModule.getNetworkStatus === 'function');
-      const availableMethods = NativeModule ? Object.keys(NativeModule).filter(k => typeof NativeModule[k] === 'function') : [];
-      const allKeys = NativeModule ? Object.keys(NativeModule) : [];
-      const nativeModuleType = NativeModule ? typeof NativeModule : 'null';
-      console.log('[DEBUG] NetworkMonitor.initialize() entry, hasNativeModule:', !!NativeModule, 'hasGetNetworkStatus:', hasGetNetworkStatus, 'availableMethods:', availableMethods, 'allKeys:', allKeys, 'nativeModuleType:', nativeModuleType);
-      // Try to call getNetworkStatus directly even if it's not enumerable
-      if (NativeModule && !hasGetNetworkStatus) {
-        try {
-          const testResult = await NativeModule.getNetworkStatus();
-          console.log('[DEBUG] getNetworkStatus() call succeeded despite not being enumerable! Result:', testResult);
-          // If it works, continue with initialization
-        } catch (e) {
-          console.log('[DEBUG] getNetworkStatus() call failed:', e);
-        }
-      }
       // Check if native module is available
-      // Try calling getNetworkStatus even if it's not enumerable (React Native methods might not be)
       let canCallGetNetworkStatus = false;
       if (NativeModule) {
         try {
-          // Try to call it - React Native methods might exist but not be enumerable
           const testCall = NativeModule.getNetworkStatus;
           canCallGetNetworkStatus = typeof testCall === 'function';
           if (!canCallGetNetworkStatus) {
-            // Try calling it directly as a last resort - sometimes methods exist but aren't enumerable
-            console.log('[DEBUG] getNetworkStatus not found as property, trying direct call...');
+            // Try calling it directly - sometimes methods exist but aren't enumerable
             try {
               const testResult = await NativeModule.getNetworkStatus();
-              console.log('[DEBUG] Direct call to getNetworkStatus() succeeded! Result:', testResult);
               canCallGetNetworkStatus = true;
               // If direct call works, use it
               this.currentStatus = this.mapNativeStatus(testResult);
-              console.log('[DEBUG] NetworkMonitor initialized with status:', this.currentStatus);
               return;
             } catch (e) {
-              console.log('[DEBUG] Direct call to getNetworkStatus() failed:', e);
+              // Method doesn't exist
             }
           }
         } catch (e) {
-          console.warn('[DEBUG] Error checking getNetworkStatus:', e);
+          // Error checking
         }
       }
       
       if (!NativeModule || !canCallGetNetworkStatus) {
-        console.warn('[DEBUG] Native network module not available, hasNativeModule:', !!NativeModule, 'getNetworkStatus type:', NativeModule ? typeof NativeModule.getNetworkStatus : 'N/A', 'canCallGetNetworkStatus:', canCallGetNetworkStatus);
-        console.warn('Native network module is not available. Network monitoring will be disabled.');
-        console.warn('IMPORTANT: The getNetworkStatus method is not exposed. You MUST rebuild the app:');
-        console.warn('  cd /Users/punithmanthri/Downloads/OfflineDemoApp/android && ./gradlew clean && cd .. && npx react-native run-android');
+        if (__DEV__) {
+          console.warn('Native network module is not available. Network monitoring will be disabled.');
+        }
         this.currentStatus = 'unknown';
         return;
       }
@@ -102,22 +87,24 @@ class NetworkMonitor extends EventEmitter {
         try {
           const hasPermission = await NativeModule.hasNetworkPermission();
           if (!hasPermission) {
-            console.warn('ACCESS_NETWORK_STATE permission not granted. Network status will be "unknown".');
-            console.warn('Please add <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" /> to AndroidManifest.xml');
+            if (__DEV__) {
+              console.warn('ACCESS_NETWORK_STATE permission not granted. Network status will be "unknown".');
+            }
             this.currentStatus = 'unknown';
             return;
           }
         } catch (e) {
-          console.warn('Error checking network permission:', e);
           // Continue anyway - permission check might not be available on all platforms
         }
       }
 
       // Get initial status
-      console.log('[DEBUG] Calling NativeModule.getNetworkStatus()');
       const status = await NativeModule.getNetworkStatus();
-      console.log('[DEBUG] getNetworkStatus() returned:', status, 'mapped to:', this.mapNativeStatus(status));
       this.currentStatus = this.mapNativeStatus(status);
+      
+      if (__DEV__) {
+        console.log('[AUTO-DETECT] Initial network status:', { status: this.currentStatus });
+      }
 
       // Subscribe to network state changes from native module
       if (NativeEventEmitterInstance) {
@@ -128,6 +115,14 @@ class NetworkMonitor extends EventEmitter {
             if (newStatus !== this.currentStatus) {
               const previousStatus = this.currentStatus;
               this.currentStatus = newStatus;
+              
+              if (__DEV__) {
+                console.log('[AUTO-DETECT] Network status changed:', { 
+                  previous: previousStatus, 
+                  current: newStatus 
+                });
+              }
+              
               this.emit('statusChange', { previous: previousStatus, current: newStatus });
               
               if (newStatus === 'online') {
@@ -138,9 +133,15 @@ class NetworkMonitor extends EventEmitter {
             }
           }
         );
+        
+        if (__DEV__) {
+          console.log('[AUTO-DETECT] Subscribed to native network status events');
+        }
       }
     } catch (error) {
-      console.warn('Failed to initialize NetworkMonitor:', error);
+      if (__DEV__) {
+        console.warn('Failed to initialize NetworkMonitor:', error);
+      }
       this.currentStatus = 'unknown';
       // Don't throw - allow module to continue loading
     }
@@ -191,17 +192,23 @@ class NetworkMonitor extends EventEmitter {
    * Refresh network status from native module (async)
    */
   async refreshStatus(): Promise<void> {
+    if (__DEV__) {
+      console.log('[AUTO-DETECT] Refreshing network status...');
+    }
     if (NativeModule && this.currentStatus === 'unknown') {
       try {
-        // Try calling getNetworkStatus even if it's not enumerable
         const status = await NativeModule.getNetworkStatus();
         const mappedStatus = this.mapNativeStatus(status);
         if (mappedStatus !== 'unknown') {
           this.currentStatus = mappedStatus;
-          console.log('[DEBUG] NetworkMonitor.refreshStatus() updated status to:', this.currentStatus);
+          if (__DEV__) {
+            console.log('[AUTO-DETECT] Network status refreshed:', { status: mappedStatus });
+          }
         }
       } catch (e) {
-        console.warn('[DEBUG] refreshStatus() error:', e);
+        if (__DEV__) {
+          console.warn('[AUTO-DETECT] Failed to refresh network status:', e);
+        }
       }
     }
   }

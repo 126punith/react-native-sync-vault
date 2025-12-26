@@ -1,4 +1,3 @@
-import { NativeModules } from 'react-native';
 import {
   QueuedRequest,
   RequestStatus,
@@ -14,17 +13,15 @@ import { performanceTracker } from './utils/performance';
 import QueueManager from './QueueManager';
 import ConflictResolver from './ConflictResolver';
 import NetworkMonitor from './NetworkMonitor';
+import CacheManager from './cache/CacheManager';
+import SmartCacheManager from './cache/SmartCacheManager';
+import ResourceManager from './resources/ResourceManager';
+import ResourceAwareSync from './sync/ResourceAwareSync';
+import { ResourceAwareConfig } from './types';
+import { getNativeModule } from './utils/nativeModule';
 
-// Get native module with error handling
-let NativeModule: any = null;
-try {
-  NativeModule = NativeModules.OfflineQueue;
-  if (!NativeModule) {
-    console.warn('OfflineQueue native module not found in SyncEngine. Some features may not work.');
-  }
-} catch (error) {
-  console.warn('Failed to access native module in SyncEngine:', error);
-}
+// Get native module
+const NativeModule = getNativeModule();
 
 /**
  * Sync Engine - Handles progressive synchronization of queued requests
@@ -33,17 +30,58 @@ class SyncEngine {
   private queueManager: any;
   private networkMonitor: NetworkMonitor;
   private conflictResolver: ConflictResolver;
+  private cacheManager: CacheManager | null = null;
+  private smartCacheManager: SmartCacheManager | null = null;
+  private resourceManager: ResourceManager | null = null;
+  private resourceAwareSync: ResourceAwareSync | null = null;
   private isSyncing: boolean = false;
   private syncInterval: NodeJS.Timeout | null = null;
   private baseUrl: string = '';
   private apiCallHandler?: ApiCallHandler;
+  private resourceAwareConfig?: ResourceAwareConfig;
 
-  constructor(queueManager: any, apiCallHandler?: ApiCallHandler) {
+  constructor(
+    queueManager: any,
+    apiCallHandler?: ApiCallHandler,
+    cacheManager?: CacheManager | null,
+    resourceAwareConfig?: ResourceAwareConfig
+  ) {
     this.queueManager = queueManager;
     this.networkMonitor = queueManager.getNetworkMonitor();
     this.conflictResolver = new ConflictResolver();
     this.apiCallHandler = apiCallHandler;
+    this.cacheManager = cacheManager || null;
+    this.resourceAwareConfig = resourceAwareConfig;
+    
+    // If cacheManager is SmartCacheManager, store reference
+    if (cacheManager instanceof SmartCacheManager) {
+      this.smartCacheManager = cacheManager;
+    }
+    
+    // Initialize resource-aware sync if configured
+    if (resourceAwareConfig) {
+      this.resourceManager = new ResourceManager(
+        this.networkMonitor,
+        resourceAwareConfig
+      );
+      this.resourceAwareSync = new ResourceAwareSync(this.resourceManager);
+    }
+    
     this.setupNetworkListeners();
+  }
+
+  /**
+   * Set cache manager
+   */
+  setCacheManager(cacheManager: CacheManager | null): void {
+    this.cacheManager = cacheManager;
+    
+    // Check if it's a SmartCacheManager
+    if (cacheManager instanceof SmartCacheManager) {
+      this.smartCacheManager = cacheManager;
+    } else {
+      this.smartCacheManager = null;
+    }
   }
 
   /**
@@ -51,7 +89,6 @@ class SyncEngine {
    */
   setApiCallHandler(handler: ApiCallHandler): void {
     this.apiCallHandler = handler;
-    console.log('[DEBUG] SyncEngine.setApiCallHandler() custom handler set');
   }
 
   /**
@@ -80,18 +117,30 @@ class SyncEngine {
   async startSync(): Promise<void> {
     const networkStatus = await Promise.resolve(this.networkMonitor.getStatus()).catch(() => 'unknown');
     const isOnline = await Promise.resolve(this.networkMonitor.isOnline()).catch(() => false);
-    console.log('[DEBUG] SyncEngine.startSync() entry, isSyncing:', this.isSyncing, 'networkStatus:', networkStatus, 'isOnline:', isOnline);
-    if (this.isSyncing) {
-      console.log('[DEBUG] SyncEngine.startSync() already syncing, returning');
-      return;
+    
+    if (__DEV__) {
+      console.log('[SYNC-ENGINE] Starting sync process:', { network: isOnline ? 'ONLINE' : 'OFFLINE' });
     }
-
-    if (!isOnline) {
-      console.log('[DEBUG] SyncEngine.startSync() not online, networkStatus:', networkStatus);
+    
+    if (this.isSyncing || !isOnline) {
+      if (__DEV__) {
+        console.log('[SYNC-ENGINE] Sync skipped:', { 
+          isSyncing: this.isSyncing, 
+          isOnline 
+        });
+      }
       return;
     }
 
     this.isSyncing = true;
+
+    // Emit sync started event
+    if (this.queueManager && typeof this.queueManager.emit === 'function') {
+      this.queueManager.emit('sync:started');
+      if (__DEV__) {
+        console.log('[EVENT] Emitting sync:started');
+      }
+    }
 
     try {
       const syncStatus = await NativeModule.getSyncStatus();
@@ -106,11 +155,22 @@ class SyncEngine {
       // Process batches
       await this.processSyncBatches(batchSize, intervalMs);
     } catch (error) {
-      console.error('Sync error:', error);
-      await NativeModule.updateSyncStatus({
-        syncInProgress: 0,
-        lastError: error instanceof Error ? error.message : String(error),
-      });
+      if (__DEV__) {
+        console.error('Sync error:', error);
+      }
+      if (NativeModule) {
+        await NativeModule.updateSyncStatus({
+          syncInProgress: 0,
+          lastError: error instanceof Error ? error.message : String(error),
+        }).catch(() => {});
+      }
+      // Emit sync failed event
+      if (this.queueManager && typeof this.queueManager.emit === 'function') {
+        this.queueManager.emit('sync:failed', { error });
+        if (__DEV__) {
+          console.log('[EVENT] Emitting sync:failed:', { error: error instanceof Error ? error.message : String(error) });
+        }
+      }
     } finally {
       this.isSyncing = false;
     }
@@ -120,6 +180,9 @@ class SyncEngine {
    * Stop sync process
    */
   stopSync(): void {
+    if (__DEV__) {
+      console.log('[SYNC-ENGINE] Stopping sync process');
+    }
     this.isSyncing = false;
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
@@ -138,53 +201,74 @@ class SyncEngine {
 
     while (hasMore && this.isSyncing && await Promise.resolve(this.networkMonitor.isOnline()).catch(() => false)) {
       const startTime = Date.now();
-      const batch = await this.queueManager.getPendingRequests(batchSize, 0);
-      console.log('[DEBUG] processSyncBatches() got batch:', {
-        batchSize: batch.length,
-        expectedBatchSize: batchSize,
-        requests: batch.map((r: any) => ({
-          id: r.id,
-          method: r.method,
-          url: r.url,
-          status: r.status
-        }))
-      });
+      let batch = await this.queueManager.getPendingRequests(batchSize, 0);
 
       if (batch.length === 0) {
-        console.log('[DEBUG] processSyncBatches() no more requests, breaking loop');
         hasMore = false;
         break;
       }
 
+      if (__DEV__) {
+        console.log('[SYNC-ENGINE] Processing batch:', { 
+          batchSize: batch.length,
+          originalBatchSize: batchSize 
+        });
+      }
+
+      // Apply resource-aware filtering and sorting if enabled
+      if (this.resourceAwareSync) {
+        const originalLength = batch.length;
+        batch = this.resourceAwareSync.filterRequests(batch);
+        batch = this.resourceAwareSync.sortByPriority(batch);
+        
+        // Adjust batch size based on resources
+        const adjustedBatchSize = this.resourceAwareSync.getBatchSize(batchSize);
+        batch = batch.slice(0, adjustedBatchSize);
+        
+        if (__DEV__) {
+          console.log('[SYNC-ENGINE] Resource-aware filtering:', { 
+            original: originalLength,
+            filtered: batch.length 
+          });
+        }
+      }
+
+      if (batch.length === 0) {
+        // All requests filtered out, wait before retry
+        await this.sleep(intervalMs);
+        continue;
+      }
+
       // Process batch concurrently
-      console.log('[DEBUG] processSyncBatches() processing batch of', batch.length, 'requests');
-      console.log('[DEBUG] processSyncBatches() calling Promise.allSettled with', batch.length, 'syncRequest calls');
-      
       const results = await Promise.allSettled(
-        batch.map((request: QueuedRequest) => {
-          console.log('[DEBUG] processSyncBatches() mapping request to syncRequest:', request.id);
-          return this.syncRequest(request);
-        })
+        batch.map((request: QueuedRequest) => this.syncRequest(request))
       );
       
-      console.log('[DEBUG] processSyncBatches() Promise.allSettled completed:', {
-        total: results.length,
-        fulfilled: results.filter(r => r.status === 'fulfilled').length,
-        rejected: results.filter(r => r.status === 'rejected').length,
-        results: results.map((r, i) => ({
-          index: i,
-          status: r.status,
-          value: r.status === 'fulfilled' ? 'success' : (r.reason?.message || String(r.reason)),
-          requestId: batch[i]?.id
-        }))
-      });
+      const successCount = results.filter(r => r.status === 'fulfilled').length;
+      const duration = Date.now() - startTime;
 
       performanceTracker.trackSync(startTime);
-
-      // Update sync status
-      console.log('[DEBUG] processSyncBatches() updating sync status after batch');
       await this.updateSyncStatusAfterBatch(batch.length);
-      console.log('[DEBUG] processSyncBatches() batch completed, processed', batch.length, 'requests');
+
+      // Emit batch completed event
+      if (this.queueManager && typeof this.queueManager.emit === 'function') {
+        this.queueManager.emit('sync:batch:completed', { 
+          batchSize: batch.length,
+          duration 
+        });
+        
+        if (__DEV__) {
+          console.log('[SYNC-ENGINE] Batch completed:', { 
+            successCount,
+            totalCount: batch.length,
+            duration: `${duration}ms` 
+          });
+          console.log('[EVENT] Emitting sync:batch:completed:', { 
+            batchSize: batch.length,
+            duration 
+          });
+        }
+      }
 
       // Wait before next batch
       if (hasMore) {
@@ -197,27 +281,29 @@ class SyncEngine {
       syncInProgress: 0,
       lastSyncAt: Date.now(),
     });
+
+    // Emit sync completed event
+    if (this.queueManager && typeof this.queueManager.emit === 'function') {
+      this.queueManager.emit('sync:completed', { timestamp: Date.now() });
+      if (__DEV__) {
+        console.log('[EVENT] Emitting sync:completed:', { timestamp: Date.now() });
+      }
+    }
   }
 
   /**
    * Sync a single request
    */
   private async syncRequest(request: QueuedRequest): Promise<void> {
-    console.log('[DEBUG] syncRequest() entry:', {
-      requestId: request.id,
-      method: request.method,
-      url: request.url,
-      status: request.status,
-      attemptCount: request.attemptCount,
-      maxRetries: request.maxRetries,
-      hasBody: !!request.body,
-      hasHeaders: !!request.headers && Object.keys(request.headers).length > 0,
-      hasQueryParams: !!request.queryParams && Object.keys(request.queryParams).length > 0
-    });
-
+    if (__DEV__) {
+      console.log('[SYNC-ENGINE] Syncing request:', { 
+        requestId: request.id, 
+        method: request.method, 
+        url: request.url 
+      });
+    }
     try {
       // Update status to syncing
-      console.log('[DEBUG] syncRequest() updating status to syncing for request:', request.id);
       await this.queueManager.updateRequestStatus(request.id, 'syncing', {
         lastAttemptAt: Date.now(),
         attemptCount: request.attemptCount + 1,
@@ -225,27 +311,8 @@ class SyncEngine {
 
       // Build full URL
       const url = this.buildUrl(request.url, request.queryParams);
-      console.log('[DEBUG] syncRequest() built full URL:', {
-        originalUrl: request.url,
-        fullUrl: url,
-        hasQueryParams: !!request.queryParams && Object.keys(request.queryParams).length > 0,
-        queryParams: request.queryParams
-      });
-
-      // Log request data being sent
-      console.log('[DEBUG] syncRequest() request data:', {
-        method: request.method,
-        url: url,
-        headers: request.headers || {},
-        body: request.body ? {
-          preview: JSON.stringify(request.body).substring(0, 200),
-          length: JSON.stringify(request.body).length,
-          type: typeof request.body
-        } : null
-      });
 
       // Make API request
-      console.log('[DEBUG] syncRequest() calling makeRequest()...');
       const response = await this.makeRequest(
         request.method,
         url,
@@ -253,49 +320,22 @@ class SyncEngine {
         request.body,
         request.queryParams
       );
-      
-      // Convert headers to object
-      const headersObj: Record<string, string> = {};
-      if (response.headers && typeof response.headers.forEach === 'function') {
-        response.headers.forEach((value: string, key: string) => {
-          headersObj[key] = value;
-        });
-      } else if (response.headers && typeof (response.headers as any).entries === 'function') {
-        try {
-          Object.assign(headersObj, Object.fromEntries((response.headers as any).entries()));
-        } catch (e) {
-          // Fallback if entries() not available
-        }
-      }
-
-      console.log('[DEBUG] syncRequest() received response:', {
-        status: response.status,
-        statusText: response.statusText,
-        ok: response.ok,
-        headers: headersObj
-      });
 
       // Handle response
       if (response.ok) {
-        console.log('[DEBUG] syncRequest() response is OK, calling handleSuccess()');
         await this.handleSuccess(request, response);
       } else if (response.status === 409) {
-        console.log('[DEBUG] syncRequest() conflict detected (409), calling handleConflict()');
         await this.handleConflict(request, response);
       } else {
-        console.log('[DEBUG] syncRequest() error response:', {
-          status: response.status,
-          statusText: response.statusText
-        });
         await this.handleError(request, response);
       }
-    } catch (error) {
-      console.error('[DEBUG] syncRequest() exception caught:', {
-        requestId: request.id,
-        error: error instanceof Error ? error.message : String(error),
-        errorType: error instanceof Error ? error.constructor.name : typeof error,
-        stack: error instanceof Error ? error.stack : undefined
-      });
+      } catch (error) {
+        if (__DEV__) {
+          console.error('[SYNC-ENGINE] Request sync failed:', { 
+            requestId: request.id, 
+            error: error instanceof Error ? error.message : String(error) 
+          });
+        }
       await this.handleNetworkError(request, error);
     }
   }
@@ -312,22 +352,9 @@ class SyncEngine {
     queryParams?: Record<string, string>
   ): Promise<Response> {
     const fullUrl = url.startsWith('http') ? url : `${this.baseUrl}${url}`;
-    
-    console.log('[DEBUG] makeRequest() entry:', {
-      method,
-      url,
-      fullUrl,
-      hasBody: !!body,
-      bodySize: body ? JSON.stringify(body).length : 0,
-      headers: Object.keys(headers),
-      baseUrl: this.baseUrl,
-      hasCustomHandler: !!this.apiCallHandler
-    });
 
     // Use custom API call handler if provided
     if (this.apiCallHandler) {
-      console.log('[DEBUG] makeRequest() using custom apiCallHandler');
-      const startTime = Date.now();
       try {
         const request: ApiCallRequest = {
           method,
@@ -340,35 +367,8 @@ class SyncEngine {
           queryParams,
         };
 
-        console.log('[DEBUG] makeRequest() calling custom handler with request:', {
-          method: request.method,
-          url: request.url,
-          headers: request.headers,
-          hasBody: !!request.body,
-          hasQueryParams: !!request.queryParams
-        });
-
         const customResponse = await this.apiCallHandler(request);
-        const duration = Date.now() - startTime;
-
-        console.log('[DEBUG] makeRequest() custom handler completed:', {
-          status: customResponse.status,
-          statusText: customResponse.statusText,
-          ok: customResponse.ok,
-          duration: `${duration}ms`,
-          hasHeaders: !!customResponse.headers
-        });
-
-        // Convert ApiCallResponse to fetch Response-like object
-        // We need to create a Response object that matches the fetch API
         const responseText = await customResponse.text();
-        
-        console.log('[DEBUG] makeRequest() custom handler response text:', {
-          status: customResponse.status,
-          ok: customResponse.ok,
-          responseTextLength: responseText.length,
-          responseTextPreview: responseText.substring(0, 200)
-        });
 
         // Create a Response object that works with existing code
         const responseHeaders = new Headers();
@@ -378,28 +378,20 @@ class SyncEngine {
           });
         }
 
-        const response = new Response(responseText, {
+        return new Response(responseText, {
           status: customResponse.status,
           statusText: customResponse.statusText,
           headers: responseHeaders,
         });
-
-        return response;
-      } catch (error) {
-        const duration = Date.now() - startTime;
-        console.error('[DEBUG] makeRequest() custom handler error:', {
-          error: error instanceof Error ? error.message : String(error),
-          errorType: error instanceof Error ? error.constructor.name : typeof error,
-          duration: `${duration}ms`,
-          url: fullUrl,
-          method
-        });
+        } catch (error) {
+          if (__DEV__) {
+            console.error('Custom API handler error:', error);
+          }
         throw error;
       }
     }
 
     // Fallback to default fetch() implementation
-    console.log('[DEBUG] makeRequest() using default fetch() implementation');
 
     const requestOptions: RequestInit = {
       method,
@@ -411,71 +403,14 @@ class SyncEngine {
 
     if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH')) {
       requestOptions.body = JSON.stringify(body);
-      console.log('[DEBUG] makeRequest() request body:', {
-        bodyPreview: JSON.stringify(body).substring(0, 200),
-        bodyLength: JSON.stringify(body).length
-      });
     }
 
-    console.log('[DEBUG] makeRequest() request options:', {
-      method: requestOptions.method,
-      headers: requestOptions.headers,
-      hasBody: !!requestOptions.body,
-      bodyLength: requestOptions.body ? String(requestOptions.body).length : 0
-    });
-
-    console.log('[DEBUG] makeRequest() calling fetch() with URL:', fullUrl);
-    const startTime = Date.now();
-    
     try {
-      const response = await fetch(fullUrl, requestOptions);
-      const duration = Date.now() - startTime;
-      
-      console.log('[DEBUG] makeRequest() fetch() completed:', {
-        status: response.status,
-        statusText: response.statusText,
-        ok: response.ok,
-        duration: `${duration}ms`,
-        headers: (() => {
-          const headersObj: Record<string, string> = {};
-          if (response.headers && typeof response.headers.forEach === 'function') {
-            response.headers.forEach((value: string, key: string) => {
-              headersObj[key] = value;
-            });
-          } else if (response.headers && typeof (response.headers as any).entries === 'function') {
-            try {
-              Object.assign(headersObj, Object.fromEntries((response.headers as any).entries()));
-            } catch (e) {
-              // Fallback if entries() not available
-            }
-          }
-          return headersObj;
-        })()
-      });
-
-      // Log response body preview (first 200 chars)
-      try {
-        const responseClone = response.clone();
-        const text = await responseClone.text();
-        console.log('[DEBUG] makeRequest() response body preview:', {
-          bodyPreview: text.substring(0, 200),
-          bodyLength: text.length,
-          isJSON: text.trim().startsWith('{') || text.trim().startsWith('[')
-        });
-      } catch (parseError) {
-        console.log('[DEBUG] makeRequest() could not parse response body:', parseError);
-      }
-
-      return response;
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      console.error('[DEBUG] makeRequest() fetch() error:', {
-        error: error instanceof Error ? error.message : String(error),
-        errorType: error instanceof Error ? error.constructor.name : typeof error,
-        duration: `${duration}ms`,
-        url: fullUrl,
-        method
-      });
+      return await fetch(fullUrl, requestOptions);
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Network request failed:', error);
+        }
       throw error;
     }
   }
@@ -500,70 +435,73 @@ class SyncEngine {
     request: QueuedRequest,
     response: Response
   ): Promise<void> {
-    console.log('[DEBUG] handleSuccess() entry:', {
-      requestId: request.id,
-      method: request.method,
-      url: request.url,
-      responseStatus: response.status,
-      responseStatusText: response.statusText
-    });
-
     let responseData: any;
     try {
       const responseText = await response.text();
-      console.log('[DEBUG] handleSuccess() response text:', {
-        textLength: responseText.length,
-        textPreview: responseText.substring(0, 200),
-        isJSON: responseText.trim().startsWith('{') || responseText.trim().startsWith('[')
-      });
-      
       try {
         responseData = JSON.parse(responseText);
-        console.log('[DEBUG] handleSuccess() parsed JSON response:', {
-          hasData: !!responseData,
-          dataKeys: responseData && typeof responseData === 'object' ? Object.keys(responseData) : [],
-          dataPreview: JSON.stringify(responseData).substring(0, 200)
-        });
-      } catch (parseError) {
-        console.log('[DEBUG] handleSuccess() response is not JSON, using empty object');
+      } catch {
         responseData = {};
       }
-    } catch (error) {
-      console.error('[DEBUG] handleSuccess() error reading response:', error);
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Error reading response:', error);
+        }
       responseData = {};
     }
-
-    console.log('[DEBUG] handleSuccess() updating request status to synced:', {
-      requestId: request.id,
-      responseDataSize: JSON.stringify(responseData).length
-    });
 
     await this.queueManager.updateRequestStatus(request.id, 'synced', {
       serverResponse: responseData,
       syncedAt: Date.now(),
     });
 
+    if (__DEV__) {
+      console.log('[SYNC-ENGINE] Request synced successfully:', { requestId: request.id });
+    }
+
     // Update data point if exists
     if (request.localDataId) {
-      console.log('[DEBUG] handleSuccess() updating data point:', {
-        requestId: request.id,
-        localDataId: request.localDataId,
-        serverVersion: responseData.version || 1
-      });
       await NativeModule.updateDataPoint(request.id, {
         serverSnapshot: responseData,
         serverVersion: responseData.version || 1,
         dataStatus: 'synced',
       });
-    } else {
-      console.log('[DEBUG] handleSuccess() no localDataId, skipping data point update');
     }
 
     // Update sync status
-    console.log('[DEBUG] handleSuccess() incrementing sync counter');
     await this.incrementSyncCounter();
     
-    console.log('[DEBUG] handleSuccess() completed successfully for request:', request.id);
+    // Cache successful GET requests
+    if (this.cacheManager?.isEnabled() && request.method === 'GET') {
+      try {
+        const cacheKey = this.buildUrl(request.url, request.queryParams);
+        const endpoint = request.url.split('?')[0]; // Remove query params for endpoint matching
+        
+        if (this.smartCacheManager) {
+          // Use smart cache with endpoint-specific TTL
+          await this.smartCacheManager.set(cacheKey, responseData, {
+            endpoint,
+          });
+        } else {
+          // Fallback to regular cache
+          await this.cacheManager.set(cacheKey, responseData, {
+            ttl: 3600, // Default 1 hour
+          });
+        }
+      } catch (error) {
+        // Cache failures are non-critical
+      }
+    }
+    
+    // Invalidate cache on successful mutations (POST, PUT, DELETE)
+    if (this.smartCacheManager && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(request.method)) {
+      try {
+        const url = this.buildUrl(request.url, request.queryParams);
+        await this.smartCacheManager.invalidateOnMutate(request.method, url);
+      } catch (error) {
+        // Invalidation failures are non-critical
+      }
+    }
   }
 
   /**
@@ -618,8 +556,10 @@ class SyncEngine {
           conflictData: null,
         });
       }
-    } catch (error) {
-      console.error('Conflict resolution error:', error);
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Conflict resolution error:', error);
+        }
     }
   }
 
@@ -632,6 +572,15 @@ class SyncEngine {
   ): Promise<void> {
     const errorData = await response.text().catch(() => '');
     const failureType = this.categorizeError(response.status);
+
+    if (__DEV__) {
+      console.log('[SYNC-ENGINE] Request sync failed:', { 
+        requestId: request.id, 
+        status: response.status,
+        failureType,
+        error: errorData.substring(0, 100) // Limit error message length
+      });
+    }
 
     const shouldRetryRequest = shouldRetry(
       failureType,
@@ -663,6 +612,13 @@ class SyncEngine {
   ): Promise<void> {
     const failureType: FailureType = 'network';
     const errorMessage = error instanceof Error ? error.message : String(error);
+
+    if (__DEV__) {
+      console.log('[SYNC-ENGINE] Network error during sync:', { 
+        requestId: request.id, 
+        error: errorMessage 
+      });
+    }
 
     const shouldRetryRequest = shouldRetry(
       failureType,
@@ -728,9 +684,10 @@ class SyncEngine {
       
       // The native module should handle storing in failed_requests table
       // This is a simplified version - in production, you'd have a dedicated method
-      console.log('Failed request stored:', failedRequestData);
-    } catch (error) {
-      console.error('Failed to store failed request:', error);
+      } catch (error) {
+        if (__DEV__) {
+          console.error('Failed to store failed request:', error);
+        }
     }
   }
 
@@ -743,8 +700,10 @@ class SyncEngine {
       await NativeModule.updateSyncStatus({
         totalSynced: (syncStatus?.totalSynced || 0) + batchSize,
       });
-    } catch (error) {
-      console.warn('Failed to update sync status:', error);
+      } catch (error) {
+        if (__DEV__) {
+          console.warn('Failed to update sync status:', error);
+        }
     }
   }
 
@@ -757,8 +716,10 @@ class SyncEngine {
       await NativeModule.updateSyncStatus({
         totalSynced: (syncStatus?.totalSynced || 0) + 1,
       });
-    } catch (error) {
-      console.warn('Failed to increment sync counter:', error);
+      } catch (error) {
+        if (__DEV__) {
+          console.warn('Failed to increment sync counter:', error);
+        }
     }
   }
 

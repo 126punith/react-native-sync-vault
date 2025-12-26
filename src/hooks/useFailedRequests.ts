@@ -4,9 +4,9 @@ import QueueManager from '../QueueManager';
 
 /**
  * Hook for getting failed requests
- * @param pollInterval - Polling interval in milliseconds. Set to 0 to disable polling. Default: 5000ms
+ * Uses event listeners instead of polling for reactive updates
  */
-export function useFailedRequests(pollInterval: number = 5000) {
+export function useFailedRequests() {
   const [failedRequests, setFailedRequests] = useState<FailedRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -25,14 +25,26 @@ export function useFailedRequests(pollInterval: number = 5000) {
   }, []);
 
   useEffect(() => {
+    // Initial fetch
     fetchFailedRequests();
 
-    // Only poll if interval is greater than 0
-    if (pollInterval > 0) {
-      const interval = setInterval(fetchFailedRequests, pollInterval);
-      return () => clearInterval(interval);
+    // Listen to failed requests change events
+    const handleFailedChange = (newFailedRequests: FailedRequest[]) => {
+      setFailedRequests(newFailedRequests);
+      setError(null);
+    };
+
+    // Subscribe to events
+    if (QueueManager && typeof QueueManager.on === 'function') {
+      QueueManager.on('queue:failed:changed', handleFailedChange);
+      QueueManager.on('queue:request:failed', fetchFailedRequests);
+      
+      return () => {
+        QueueManager.off('queue:failed:changed', handleFailedChange);
+        QueueManager.off('queue:request:failed', fetchFailedRequests);
+      };
     }
-  }, [fetchFailedRequests, pollInterval]);
+  }, [fetchFailedRequests]);
 
   /**
    * Retry a failed request
