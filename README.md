@@ -516,3 +516,24 @@ MIT
 ---
 
 **Made with ❤️ for the React Native community**
+
+---
+
+## 🗺️ Option B Evolution: The Local Data Layer Roadmap
+
+Sync Vault is shifting from a durable outbox to a **complete, reactive, offline-first data layer**. We are actively expanding the native SQLite core to manage your local source of truth, handle local relational queries, and surface reactive updates directly to your UI components.
+
+### Progress & Upcoming Milestones
+- [x] **Native Outbox Core:** Transactional SQLite engine with native retry state machines (Kotlin/Swift).
+- [ ] **Declarative Relational Schema:** Define local models, indexes, and relationships (`hasMany`, `belongsTo`) directly over the native DB.
+- [ ] **Reactive Observation Layer:** Live table and row-level SQL hooks that auto-trigger UI updates when data changes, eliminating manual state synchronization.
+- [ ] **Hybrid Synchronisation Engine:** Native-driven conflict resolution leveraging local operation tracking to seamlessly reconcile state with your server.
+
+---
+
+## 💡 How It Integrates with the Pro Ecosystem
+
+`react-native-sync-vault` is, and will always remain, **100% free and open-source** under the MIT license. It serves as the open foundation for highly resilient, offline-capable application architectures.
+
+If your application requires enterprise-grade background tracking infrastructure that integrates seamlessly with your local database architecture, check out our premium sibling module:
+- 🤖 [React Native Background Location Pro (Android)](https://github.com/126punith/react-native-background-location-pro)
