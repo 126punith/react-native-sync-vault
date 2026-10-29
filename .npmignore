@@ -1,6 +1,8 @@
-# Source files
-src/
+# Tests (src/ is published because codegen reads src/specs)
 __tests__/
+server/
+examples/
+scripts/
 
 # Development files
 tsconfig.json
@@ -36,6 +38,7 @@ dist/
 # Temporary files
 *.tmp
 *.temp
+
 
 
 

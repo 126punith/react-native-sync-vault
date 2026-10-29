@@ -1,48 +1,28 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, ViewStyle, TextStyle } from 'react-native';
+import React from 'react';
+import { ActivityIndicator, StyleSheet, Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
 import { useOfflineContext } from './OfflineProvider';
 
-/**
- * Sync Progress Props
- */
 interface SyncProgressProps {
-  style?: ViewStyle;
-  textStyle?: TextStyle;
+  style?: StyleProp<ViewStyle>;
+  textStyle?: StyleProp<TextStyle>;
   showText?: boolean;
   size?: 'small' | 'large';
 }
 
-/**
- * Sync Progress
- * Shows sync progress indicator
- */
-export function SyncProgress({
-  style,
-  textStyle,
-  showText = true,
-  size = 'small',
-}: SyncProgressProps) {
-  const { isSyncing, queueSize } = useOfflineContext();
+/** Spinner while the engine is draining, otherwise the queued count. */
+export function SyncProgress({ style, textStyle, showText = true, size = 'small' }: SyncProgressProps) {
+  const { isDraining, pendingCount } = useOfflineContext();
 
-  if (!isSyncing && queueSize === 0) {
-    return null;
-  }
+  if (!isDraining && pendingCount === 0) return null;
 
   return (
     <View style={[styles.container, style]}>
-      {isSyncing && (
-        <>
-          <ActivityIndicator size={size} color="#2196F3" style={styles.spinner} />
-          {showText && (
-            <Text style={[styles.text, textStyle]}>
-              Syncing{queueSize > 0 ? ` ${queueSize} items` : ''}...
-            </Text>
-          )}
-        </>
-      )}
-      {!isSyncing && queueSize > 0 && showText && (
+      {isDraining && <ActivityIndicator size={size} color="#2196F3" style={styles.spinner} />}
+      {showText && (
         <Text style={[styles.text, textStyle]}>
-          {queueSize} item{queueSize !== 1 ? 's' : ''} queued
+          {isDraining
+            ? `Syncing${pendingCount > 0 ? ` ${pendingCount} items` : ''}...`
+            : `${pendingCount} item${pendingCount !== 1 ? 's' : ''} queued`}
         </Text>
       )}
     </View>
@@ -64,4 +44,3 @@ const styles = StyleSheet.create({
     color: '#666',
   },
 });
-

@@ -1,50 +1,66 @@
 buildscript {
-    ext {
-        buildToolsVersion = "33.0.0"
-        minSdkVersion = 21
-        compileSdkVersion = 33
-        targetSdkVersion = 33
-        ndkVersion = "23.1.7779620"
+    ext.safeExtGet = { prop, fallback ->
+        rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
     }
     repositories {
         google()
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:7.4.2")
+        classpath "com.android.tools.build:gradle:8.6.0"
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:${safeExtGet('kotlinVersion', '1.9.24')}"
     }
 }
 
 apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+// New Architecture only: runs codegen for src/specs and generates NativeSyncVaultSpec.
+apply plugin: "com.facebook.react"
 
 android {
-    compileSdkVersion rootProject.ext.compileSdkVersion
-    buildToolsVersion rootProject.ext.buildToolsVersion
+    namespace "com.syncvault"
+    compileSdkVersion safeExtGet("compileSdkVersion", 35)
 
     defaultConfig {
-        minSdkVersion rootProject.ext.minSdkVersion
-        targetSdkVersion rootProject.ext.targetSdkVersion
+        minSdkVersion safeExtGet("minSdkVersion", 24)
+        targetSdkVersion safeExtGet("targetSdkVersion", 35)
+        consumerProguardFiles "proguard-rules.pro"
     }
 
-    buildTypes {
-        release {
-            minifyEnabled false
+    buildFeatures {
+        buildConfig false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    sourceSets {
+        main {
+            // Shared SQL schema, loaded at runtime from assets/sync_vault/*.sql
+            assets.srcDirs += ["../schema"]
         }
     }
 
-    lintOptions {
-        disable 'GradleCompatible'
+    lint {
+        disable "GradleCompatible"
     }
 }
 
 repositories {
-    mavenCentral()
     google()
-    maven { url "https://www.jitpack.io" }
+    mavenCentral()
 }
 
 dependencies {
-    implementation "com.facebook.react:react-native:+"
-    implementation "com.github.ospfranco:react-native-nitro-sqlite:1.0.0"
+    implementation "com.facebook.react:react-android"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
+    implementation "androidx.work:work-runtime-ktx:2.9.1"
+    implementation "androidx.core:core-ktx:1.13.1"
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
 }
-

@@ -1,362 +1,143 @@
-import { InterceptorConfig } from './types';
+import { SyncVault } from './core/SyncVault';
+import { findHeader, headersToObject, QUEUED_HEADER, REQUEST_ID_HEADER, shouldIntercept, withoutHeaders } from './ApiInterceptor';
+import type { InterceptorConfig } from './types';
+
+type AxiosConfig = {
+  url?: string;
+  baseURL?: string;
+  method?: string;
+  headers?: Record<string, unknown> & { set?: (k: string, v: string) => void; toJSON?: () => Record<string, unknown> };
+  data?: unknown;
+  params?: Record<string, string | number | boolean>;
+  adapter?: unknown;
+  __syncVaultKey?: string;
+  __syncVaultQueued?: boolean;
+};
+
+type AxiosLike = {
+  interceptors: {
+    request: { use: (onFulfilled: (c: AxiosConfig) => unknown, onRejected?: (e: unknown) => unknown) => number; eject: (id: number) => void };
+    response: { use: (onFulfilled: (r: unknown) => unknown, onRejected?: (e: unknown) => unknown) => number; eject: (id: number) => void };
+  };
+};
+
+function fullUrl(config: AxiosConfig): string {
+  const url = config.url ?? '';
+  if (!config.baseURL || /^https?:\/\//i.test(url)) return url;
+  return `${config.baseURL.replace(/\/+$/, '')}/${url.replace(/^\/+/, '')}`;
+}
+
+function plainHeaders(config: AxiosConfig): Record<string, string> {
+  const raw = config.headers?.toJSON ? config.headers.toJSON() : config.headers;
+  const flat = headersToObject(raw);
+  // Axios nests per-method defaults (common, post, ...) in the headers object.
+  return withoutHeaders(flat, ['common', 'get', 'post', 'put', 'patch', 'delete', 'head', 'options']);
+}
+
+function setHeader(config: AxiosConfig, name: string, value: string): void {
+  if (!config.headers) config.headers = {};
+  if (typeof config.headers.set === 'function') config.headers.set(name, value);
+  else (config.headers as Record<string, unknown>)[name] = value;
+}
+
+function queuedResponse(config: AxiosConfig, requestId: string) {
+  return {
+    data: { queued: true, requestId },
+    status: 202,
+    statusText: 'Accepted',
+    headers: { [QUEUED_HEADER.toLowerCase()]: 'true', [REQUEST_ID_HEADER.toLowerCase()]: requestId },
+    config,
+    request: {},
+  };
+}
 
 /**
- * Axios Interceptor - Automatically intercepts axios requests and queues them when offline
+ * Axios counterpart of ApiInterceptor: mutations get an Idempotency-Key up front, are queued
+ * when offline (resolving with a synthetic 202), and are queued on network failure.
  */
 class AxiosInterceptor {
-  private originalRequestInterceptor: number | null = null;
-  private originalResponseInterceptor: number | null = null;
-  private isEnabled: boolean = false;
-  private urlFilter?: string[];
-  private queueManager: any = null;
-  private axiosInstance: any = null;
-  private isDefaultAxios: boolean = false;
+  private axios: AxiosLike | null = null;
+  private requestId: number | null = null;
+  private responseId: number | null = null;
+  private config: InterceptorConfig = {};
 
-  /**
-   * Enable automatic axios interception
-   */
-  enable(config: InterceptorConfig, queueManager: any, axiosInstance?: any): void {
-    if (this.isEnabled) {
-      return; // Already enabled, idempotent
-    }
-
-    if (!config.axios?.enabled) {
-      return; // Not enabled in config
-    }
-
-    // Determine which axios instance to use
-    let axios: any = null;
-    if (axiosInstance) {
-      // Use provided custom instance
-      axios = axiosInstance;
-      this.isDefaultAxios = false;
-    } else {
-      // Try to use default axios instance
+  enable(config: InterceptorConfig, axiosInstance?: unknown): void {
+    if (this.axios || config.axios?.enabled === false) return;
+    let instance = (axiosInstance ?? config.axios?.instance) as AxiosLike | undefined;
+    if (!instance) {
       try {
-        axios = require('axios');
-        if (!axios || typeof axios.create !== 'function') {
-          if (__DEV__) {
-            console.error('AxiosInterceptor: axios is not available or invalid');
-          }
-          return;
-        }
-        // Use default instance
-        axios = axios.default || axios;
-        this.isDefaultAxios = true;
-      } catch (error) {
-        if (__DEV__) {
-          console.error('AxiosInterceptor: Failed to load axios:', error);
-        }
+        // axios is an optional peer dependency.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const mod = require('axios');
+        instance = (mod.default ?? mod) as AxiosLike;
+      } catch {
         return;
       }
     }
-
-    this.isEnabled = true;
-    this.urlFilter = config.urlFilter;
-    this.queueManager = queueManager;
-    this.axiosInstance = axios;
-
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-AXIOS] Enabled axios interception:', { 
-        instance: this.isDefaultAxios ? 'default' : 'custom',
-        urlFilter: config.urlFilter || [] 
-      });
-    }
-
-    // Add request interceptor
-    this.originalRequestInterceptor = axios.interceptors.request.use(
-      async (config: any) => {
-        return await this.interceptRequest(config);
-      },
-      (error: any) => {
-        return Promise.reject(error);
-      }
-    );
-
-    // Add response interceptor to handle errors
-    this.originalResponseInterceptor = axios.interceptors.response.use(
-      (response: any) => {
-        return response;
-      },
-      async (error: any) => {
-        // If it's a network error and we're offline, queue the request
-        if (this.isNetworkError(error) && !this.queueManager.getNetworkMonitor().isOnline()) {
-          return await this.handleOfflineError(error);
-        }
-        return Promise.reject(error);
-      }
+    if (!instance?.interceptors) return;
+    this.axios = instance;
+    this.config = config;
+    this.requestId = instance.interceptors.request.use((c) => this.onRequest(c));
+    this.responseId = instance.interceptors.response.use(
+      (r) => r,
+      (e) => this.onResponseError(e)
     );
   }
 
-  /**
-   * Disable automatic axios interception
-   */
   disable(): void {
-    if (!this.isEnabled || !this.axiosInstance) {
-      return; // Not enabled or no axios instance
-    }
-
-    // Remove interceptors
-    if (this.originalRequestInterceptor !== null) {
-      this.axiosInstance.interceptors.request.eject(this.originalRequestInterceptor);
-      this.originalRequestInterceptor = null;
-    }
-
-    if (this.originalResponseInterceptor !== null) {
-      this.axiosInstance.interceptors.response.eject(this.originalResponseInterceptor);
-      this.originalResponseInterceptor = null;
-    }
-
-    this.isEnabled = false;
-    this.queueManager = null;
-    this.axiosInstance = null;
-    
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-AXIOS] Disabled axios interception');
-    }
+    if (!this.axios) return;
+    if (this.requestId != null) this.axios.interceptors.request.eject(this.requestId);
+    if (this.responseId != null) this.axios.interceptors.response.eject(this.responseId);
+    this.axios = null;
+    this.requestId = null;
+    this.responseId = null;
   }
 
-  /**
-   * Verify interceptor is active (for testing)
-   */
   isActive(): boolean {
-    return this.isEnabled && this.originalRequestInterceptor !== null;
+    return this.axios != null;
   }
 
-  /**
-   * Intercept axios request
-   */
-  private async interceptRequest(config: any): Promise<any> {
-    const url = this.getRequestUrl(config);
-    const method = (config.method || 'GET').toUpperCase();
+  private async queue(config: AxiosConfig): Promise<string> {
+    const headers = plainHeaders(config);
+    const id = await SyncVault.enqueue({
+      method: (config.method ?? 'GET').toUpperCase(),
+      url: fullUrl(config),
+      body: config.data,
+      contentType: findHeader(headers, 'Content-Type'),
+      headers: withoutHeaders(headers, ['Idempotency-Key', 'Content-Type', 'Content-Length']),
+      queryParams: config.params,
+      idempotencyKey: config.__syncVaultKey,
+    });
+    config.__syncVaultQueued = true;
+    return id;
+  }
 
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-AXIOS] Intercepting request:', { method, url });
-    }
-
-    // Check URL filter - if filter exists and URL doesn't match, execute normally
-    if (this.urlFilter && this.urlFilter.length > 0) {
-      const matchesFilter = this.urlFilter.some(filter => url.startsWith(filter));
-      if (__DEV__) {
-        console.log('[INTERCEPTOR-AXIOS] URL filter check:', { 
-          matchesFilter: matchesFilter ? 'MATCH' : 'NO_MATCH',
-          url,
-          filters: this.urlFilter 
-        });
-      }
-      if (!matchesFilter) {
-        // URL doesn't match filter, execute normally
-        return config;
-      }
-    }
-
-    // Get network status
-    if (!this.queueManager) {
-      // QueueManager not available, execute normally
+  private onRequest = async (config: AxiosConfig): Promise<AxiosConfig> => {
+    const method = (config.method ?? 'GET').toUpperCase();
+    if (!shouldIntercept(this.config, method, fullUrl(config))) return config;
+    if (config.data != null && typeof config.data === 'object' && typeof FormData !== 'undefined' && config.data instanceof FormData) {
       return config;
     }
-
-    const networkMonitor = this.queueManager.getNetworkMonitor();
-    if (!networkMonitor) {
-      // NetworkMonitor not available, execute normally
-      return config;
-    }
-
-    const isOnline = networkMonitor.isOnline();
-    
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-AXIOS] Network status:', { 
-        isOnline: isOnline ? 'ONLINE' : 'OFFLINE' 
-      });
-    }
-
-    // If offline, queue the request
-    if (!isOnline) {
-      try {
-        // Extract method
-        const method = (config.method || 'GET').toUpperCase();
-
-        // Extract headers
-        const headers = config.headers || {};
-
-        // Extract body data
-        const bodyData = config.data;
-
-        // Queue the request
-        const requestId = await this.queueManager.push({
-          method,
-          url,
-          data: bodyData,
-          headers: this.normalizeHeaders(headers),
-          queryParams: config.params,
-        });
-
-        if (__DEV__) {
-          console.log('[INTERCEPTOR-AXIOS] Request queued:', { requestId, method, url });
-        }
-
-        // Reject the promise with a special error that indicates the request was queued
-        // This allows the calling code to handle it appropriately
-        const queuedError: any = new Error('Request queued for offline sync');
-        queuedError.isQueued = true;
-        queuedError.requestId = requestId;
-        queuedError.status = 202;
-        queuedError.data = { queued: true, message: 'Request queued for offline sync', requestId };
-        return Promise.reject(queuedError);
-      } catch (error) {
-        // If queuing fails, log error but allow request to proceed
-        // This prevents breaking existing code
-        if (__DEV__) {
-          console.error('[INTERCEPTOR-AXIOS] Failed to queue request:', error);
-        }
-        return config;
-      }
-    }
-
-    // Online: execute normally
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-AXIOS] Executing normally (online):', { method, url });
+    const key = findHeader(plainHeaders(config), 'Idempotency-Key') ?? SyncVault.generateId();
+    setHeader(config, 'Idempotency-Key', key);
+    config.__syncVaultKey = key;
+    if (!SyncVault.getNetworkState().isConnected) {
+      const requestId = await this.queue(config);
+      config.adapter = () => Promise.resolve(queuedResponse(config, requestId));
     }
     return config;
-  }
+  };
 
-  /**
-   * Handle offline error (when response interceptor catches network error)
-   */
-  private async handleOfflineError(error: any): Promise<any> {
-    const config = error.config;
-    if (!config) {
-      return Promise.reject(error);
+  private onResponseError = async (error: unknown): Promise<unknown> => {
+    const err = error as { config?: AxiosConfig; response?: unknown; code?: string };
+    const config = err?.config;
+    const isNetworkError = !!config && !err.response && err.code !== 'ERR_CANCELED';
+    if (!isNetworkError || this.config.queueOnNetworkError === false || !config!.__syncVaultKey || config!.__syncVaultQueued) {
+      throw error;
     }
-
-    const url = this.getRequestUrl(config);
-
-    // Check URL filter
-    if (this.urlFilter && this.urlFilter.length > 0) {
-      const matchesFilter = this.urlFilter.some(filter => url.startsWith(filter));
-      if (!matchesFilter) {
-        return Promise.reject(error);
-      }
-    }
-
-    try {
-      const method = (config.method || 'GET').toUpperCase();
-      const headers = config.headers || {};
-      const bodyData = config.data;
-
-      const requestId = await this.queueManager.push({
-        method,
-        url,
-        data: bodyData,
-        headers: this.normalizeHeaders(headers),
-        queryParams: config.params,
-      });
-
-      if (__DEV__) {
-        console.log('[INTERCEPTOR-AXIOS] Network error detected, queuing request:', { 
-          requestId, 
-          method, 
-          url 
-        });
-      }
-
-      // Return a mock response indicating the request was queued
-      return {
-        status: 202,
-        statusText: 'Accepted (Queued)',
-        data: { queued: true, message: 'Request queued for offline sync', requestId },
-        headers: {},
-        config,
-      };
-    } catch (queueError) {
-      if (__DEV__) {
-        console.error('[INTERCEPTOR-AXIOS] Failed to queue request:', queueError);
-      }
-      return Promise.reject(error);
-    }
-  }
-
-  /**
-   * Get request URL from axios config
-   */
-  private getRequestUrl(config: any): string {
-    if (config.url) {
-      // If baseURL is set, combine it with url
-      if (config.baseURL) {
-        return config.baseURL.replace(/\/$/, '') + '/' + config.url.replace(/^\//, '');
-      }
-      return config.url;
-    }
-    return '';
-  }
-
-  /**
-   * Normalize headers to plain object
-   */
-  private normalizeHeaders(headers: any): Record<string, string> {
-    if (!headers) {
-      return {};
-    }
-
-    // If headers is already a plain object
-    if (typeof headers === 'object' && !headers.get && !headers.forEach) {
-      const result: Record<string, string> = {};
-      for (const key in headers) {
-        if (headers.hasOwnProperty(key)) {
-          const value = headers[key];
-          if (value !== undefined && value !== null) {
-            result[key] = String(value);
-          }
-        }
-      }
-      return result;
-    }
-
-    // If headers is an Axios Headers object or similar
-    if (headers.get) {
-      const result: Record<string, string> = {};
-      const keys = Object.keys(headers);
-      keys.forEach(key => {
-        const value = headers.get ? headers.get(key) : headers[key];
-        if (value !== undefined && value !== null) {
-          result[key] = String(value);
-        }
-      });
-      return result;
-    }
-
-    return {};
-  }
-
-  /**
-   * Check if error is a network error
-   */
-  private isNetworkError(error: any): boolean {
-    if (!error) {
-      return false;
-    }
-
-    // Axios network errors
-    if (error.code === 'ERR_NETWORK' || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-      return true;
-    }
-
-    // Check if error message indicates network issue
-    if (error.message) {
-      const message = error.message.toLowerCase();
-      if (message.includes('network') || message.includes('timeout') || message.includes('connection')) {
-        return true;
-      }
-    }
-
-    // Check if request was made (no response means network error)
-    if (!error.response && error.request) {
-      return true;
-    }
-
-    return false;
-  }
+    const requestId = await this.queue(config!);
+    return queuedResponse(config!, requestId);
+  };
 }
 
 export default AxiosInterceptor;
-

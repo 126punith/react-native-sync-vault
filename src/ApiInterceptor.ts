@@ -1,285 +1,130 @@
-import { InterceptorConfig } from './types';
+import { SyncVault } from './core/SyncVault';
+import type { InterceptorConfig } from './types';
+
+export const DEFAULT_QUEUED_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'];
+export const QUEUED_HEADER = 'X-Sync-Vault-Queued';
+export const REQUEST_ID_HEADER = 'X-Sync-Vault-Request-Id';
+
+export function headersToObject(headers: unknown): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!headers) return result;
+  if (typeof (headers as Headers).forEach === 'function' && !Array.isArray(headers)) {
+    (headers as Headers).forEach((value: string, key: string) => {
+      result[key] = value;
+    });
+    return result;
+  }
+  if (Array.isArray(headers)) {
+    for (const [key, value] of headers as [string, string][]) result[key] = String(value);
+    return result;
+  }
+  for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (value !== undefined && value !== null) result[key] = String(value);
+  }
+  return result;
+}
+
+export function findHeader(headers: Record<string, string>, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower) return value;
+  }
+  return undefined;
+}
+
+export function withoutHeaders(headers: Record<string, string>, names: string[]): Record<string, string> {
+  const drop = new Set(names.map((n) => n.toLowerCase()));
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!drop.has(key.toLowerCase())) result[key] = value;
+  }
+  return result;
+}
+
+export function shouldIntercept(config: InterceptorConfig, method: string, url: string): boolean {
+  const methods = (config.methods ?? DEFAULT_QUEUED_METHODS).map((m) => m.toUpperCase());
+  if (!methods.includes(method.toUpperCase())) return false;
+  const filter = config.urlFilter ?? [];
+  return filter.length === 0 || filter.some((prefix) => url.startsWith(prefix));
+}
+
+function queuedResponse(requestId: string): Response {
+  return new Response(JSON.stringify({ queued: true, requestId }), {
+    status: 202,
+    statusText: 'Accepted',
+    headers: { 'Content-Type': 'application/json', [QUEUED_HEADER]: 'true', [REQUEST_ID_HEADER]: requestId },
+  });
+}
 
 /**
- * API Interceptor - Automatically intercepts fetch() calls and queues them when offline
+ * Intercepts global fetch for mutations. Every intercepted mutation gets an Idempotency-Key
+ * before the first attempt, so a request that fails online and is then queued cannot be
+ * applied twice. Offline (or on network failure) the request is queued and a 202 is returned.
  */
 class ApiInterceptor {
   private originalFetch: typeof fetch | null = null;
-  private isEnabled: boolean = false;
-  private urlFilter?: string[];
-  private queueManager: any = null;
+  private config: InterceptorConfig = {};
 
-  /**
-   * Enable automatic API interception
-   */
-  enable(config: InterceptorConfig, queueManager: any): void {
-    if (this.isEnabled) {
-      return; // Already enabled, idempotent
-    }
-
-    if (!config.enabled) {
-      return; // Not enabled in config
-    }
-
-    // Verify global.fetch exists
-    if (typeof global.fetch !== 'function') {
-      if (__DEV__) {
-        console.error('ApiInterceptor: global.fetch is not a function');
-      }
-      return;
-    }
-
-    // Store original fetch before overriding
-    this.originalFetch = global.fetch;
-    this.isEnabled = true;
-    this.urlFilter = config.urlFilter;
-    this.queueManager = queueManager;
-
-    // Override global fetch
-    const interceptedFetch = this.interceptedFetch.bind(this);
-    global.fetch = interceptedFetch;
-    
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-FETCH] Enabled fetch interception with filters:', { 
-        urlFilter: config.urlFilter || [] 
-      });
-    }
+  enable(config: InterceptorConfig = { enabled: true }): void {
+    if (this.originalFetch || config.enabled === false) return;
+    if (typeof globalThis.fetch !== 'function') return;
+    this.config = config;
+    this.originalFetch = globalThis.fetch;
+    globalThis.fetch = this.interceptedFetch as typeof fetch;
   }
 
-  /**
-   * Disable automatic API interception
-   */
   disable(): void {
-    if (!this.isEnabled || !this.originalFetch) {
-      return; // Not enabled or no original fetch to restore
-    }
-
-    // Restore original fetch
-    global.fetch = this.originalFetch;
-    this.isEnabled = false;
+    if (!this.originalFetch) return;
+    globalThis.fetch = this.originalFetch;
     this.originalFetch = null;
-    this.queueManager = null;
-    
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-FETCH] Disabled fetch interception');
-    }
   }
 
-  /**
-   * Verify interceptor is active (for testing)
-   */
   isActive(): boolean {
-    return this.isEnabled && global.fetch === this.interceptedFetch.bind(this);
+    return this.originalFetch != null;
   }
 
-  /**
-   * Intercepted fetch implementation
-   */
-  private async interceptedFetch(
-    url: RequestInfo | URL,
-    options?: RequestInit
-  ): Promise<Response> {
-    // Convert URL to string
-    let urlString: string;
-    let requestOptions: RequestInit | undefined = options;
+  private interceptedFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const original = this.originalFetch!;
+    const isRequest = typeof Request !== 'undefined' && input instanceof Request;
+    const url = typeof input === 'string' ? input : isRequest ? (input as Request).url : String(input);
+    const method = (init?.method ?? (isRequest ? (input as Request).method : 'GET')).toUpperCase();
 
-    if (typeof url === 'string') {
-      urlString = url;
-    } else if (url instanceof URL) {
-      urlString = url.toString();
-    } else if (url instanceof Request) {
-      // Handle Request object
-      urlString = url.url;
-      // Merge options from Request if options not provided
-      if (!requestOptions) {
-        requestOptions = {
-          method: url.method,
-          headers: url.headers,
-          body: url.body,
-          mode: url.mode,
-          credentials: url.credentials,
-          cache: url.cache,
-          redirect: url.redirect,
-          referrer: url.referrer,
-          integrity: url.integrity,
-        };
-      }
-    } else {
-      // Fallback for other types
-      urlString = String(url);
-    }
+    if (!shouldIntercept(this.config, method, url)) return original(input, init);
 
-    // Check URL filter - if filter exists and URL doesn't match, execute normally
-    const method = requestOptions?.method || 'GET';
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-FETCH] Intercepting request:', { method, url: urlString });
+    let rawBody: unknown = init?.body;
+    if (rawBody === undefined && isRequest) rawBody = await (input as Request).clone().text();
+    if (rawBody != null && typeof rawBody !== 'string') {
+      // FormData, Blob, and streams cannot be persisted; send them without offline support.
+      return original(input, init);
     }
-    
-    if (this.urlFilter && this.urlFilter.length > 0) {
-      const matchesFilter = this.urlFilter.some(filter => urlString.startsWith(filter));
-      if (__DEV__) {
-        console.log('[INTERCEPTOR-FETCH] URL filter check:', { 
-          matchesFilter: matchesFilter ? 'MATCH' : 'NO_MATCH',
-          url: urlString,
-          filters: this.urlFilter 
-        });
-      }
-      if (!matchesFilter) {
-        // URL doesn't match filter, execute normally
-        return this.originalFetch!(url, requestOptions);
-      }
-    }
+    const body = (rawBody as string | null | undefined) ?? null;
 
-    // Get network status
-    if (!this.queueManager) {
-      // QueueManager not available, execute normally
-      return this.originalFetch!(url, requestOptions);
-    }
+    const headers = headersToObject(init?.headers ?? (isRequest ? (input as Request).headers : undefined));
+    const idempotencyKey = findHeader(headers, 'Idempotency-Key') ?? SyncVault.generateId();
+    const sendHeaders = { ...withoutHeaders(headers, ['Idempotency-Key']), 'Idempotency-Key': idempotencyKey };
 
-    const networkMonitor = this.queueManager.getNetworkMonitor();
-    if (!networkMonitor) {
-      // NetworkMonitor not available, execute normally
-      return this.originalFetch!(url, requestOptions);
-    }
-
-    const isOnline = networkMonitor.isOnline();
-    
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-FETCH] Network status:', { 
-        isOnline: isOnline ? 'ONLINE' : 'OFFLINE' 
+    const queue = async (): Promise<Response> => {
+      const requestId = await SyncVault.enqueue({
+        method,
+        url,
+        body,
+        contentType: findHeader(headers, 'Content-Type'),
+        headers: withoutHeaders(headers, ['Idempotency-Key', 'Content-Type', 'Content-Length']),
+        idempotencyKey,
       });
-    }
+      return queuedResponse(requestId);
+    };
 
-    // If offline, queue the request
-    if (!isOnline) {
-      try {
-        // Extract method
-        const method = requestOptions?.method || 'GET';
+    if (!SyncVault.getNetworkState().isConnected) return queue();
 
-        // Extract headers
-        const headers = this.extractHeaders(requestOptions?.headers);
-
-        // Extract body data
-        const bodyData = await this.parseBody(requestOptions?.body);
-
-        // Queue the request
-        const requestId = await this.queueManager.push({
-          method,
-          url: urlString,
-          data: bodyData,
-          headers,
-        });
-
-        if (__DEV__) {
-          console.log('[INTERCEPTOR-FETCH] Request queued:', { requestId, method, url: urlString });
-        }
-
-        // Return a mock response to avoid breaking existing code
-        // Status 202 (Accepted) indicates the request was queued
-        return new Response(JSON.stringify({ queued: true, message: 'Request queued for offline sync', requestId }), {
-          status: 202,
-          statusText: 'Accepted (Queued)',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-      } catch (error) {
-        // If queuing fails, log error but still return a response
-        // to avoid breaking the calling code
-        if (__DEV__) {
-          console.error('[INTERCEPTOR-FETCH] Failed to queue request:', error);
-        }
-        return new Response(JSON.stringify({ 
-          queued: false, 
-          error: 'Failed to queue request',
-          message: error instanceof Error ? error.message : String(error)
-        }), {
-          status: 202,
-          statusText: 'Accepted (Queue Failed)',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-      }
-    }
-
-    // Online: execute normally
-    if (__DEV__) {
-      console.log('[INTERCEPTOR-FETCH] Executing normally (online):', { method, url: urlString });
-    }
-    return this.originalFetch!(url, requestOptions);
-  }
-
-  /**
-   * Extract headers from RequestInit headers
-   */
-  private extractHeaders(headers?: HeadersInit): Record<string, string> {
-    if (!headers) {
-      return {};
-    }
-
-    if (headers instanceof Headers) {
-      const result: Record<string, string> = {};
-      headers.forEach((value: string, key: string) => {
-        result[key] = value;
-      });
-      return result;
-    }
-
-    if (Array.isArray(headers)) {
-      const result: Record<string, string> = {};
-      headers.forEach(([key, value]) => {
-        result[key] = value;
-      });
-      return result;
-    }
-
-    // Plain object
-    return headers as Record<string, string>;
-  }
-
-  /**
-   * Parse request body to extract data
-   */
-  private async parseBody(body?: BodyInit | null): Promise<any> {
-    if (!body) {
-      return undefined;
-    }
-
-    // If it's already a string, try to parse as JSON
-    if (typeof body === 'string') {
-      try {
-        return JSON.parse(body);
-      } catch {
-        return body;
-      }
-    }
-
-    // If it's FormData, Blob, or ArrayBuffer, we can't easily serialize it
-    // For now, return undefined - these will need special handling
-    if (body instanceof FormData || body instanceof Blob || body instanceof ArrayBuffer) {
-      // FormData/Blob/ArrayBuffer can't be easily serialized to JSON
-      // We'll skip body for these types
-      return undefined;
-    }
-
-    // Try to read as text and parse
     try {
-      const text = await new Response(body).text();
-      if (text) {
-        try {
-          return JSON.parse(text);
-        } catch {
-          return text;
-        }
-      }
-    } catch {
-      // If we can't parse it, return undefined
+      return await original(url, { ...init, method, headers: sendHeaders, body: body ?? undefined });
+    } catch (error) {
+      const aborted = (error as { name?: string })?.name === 'AbortError';
+      if (aborted || this.config.queueOnNetworkError === false) throw error;
+      return queue();
     }
-
-    return undefined;
-  }
+  };
 }
 
 export default ApiInterceptor;
-

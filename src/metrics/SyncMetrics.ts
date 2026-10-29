@@ -1,121 +1,120 @@
-import { getMetricsCollector, SyncEventType } from './MetricsCollector';
-import NetworkMonitor from '../NetworkMonitor';
+import { SyncVault } from '../core/SyncVault';
+import type { SyncEvent } from '../core/types';
+
+export interface SyncMetricsSnapshot {
+  enqueued: number;
+  succeeded: number;
+  deadLettered: number;
+  conflicts: number;
+  retries: number;
+  authBlocked: number;
+  attempts: number;
+  /** succeeded / (succeeded + deadLettered), or 1 when nothing settled yet. */
+  successRate: number;
+  /** Mean ms from the first attempt seen in this session to success. */
+  averageDeliveryMs: number;
+  lastDrainAt: number | null;
+  since: number;
+}
 
 /**
- * Sync Metrics
- * High-level API for sync performance tracking
+ * Delivery metrics derived from engine events for the current app session. Native keeps
+ * delivering while JS is not running, so these are session-local, not lifetime totals.
  */
 class SyncMetrics {
-  private metricsCollector = getMetricsCollector();
-  private queueManager: any = null;
-  private networkMonitor: NetworkMonitor | null = null;
+  private counters = { enqueued: 0, succeeded: 0, deadLettered: 0, conflicts: 0, retries: 0, authBlocked: 0, attempts: 0 };
+  private firstAttemptAt = new Map<string, number>();
+  private totalDeliveryMs = 0;
+  private deliveries = 0;
+  private lastDrainAt: number | null = null;
+  private since = Date.now();
+  private unsubscribe: (() => void) | null = null;
+  private listeners = new Set<(snapshot: SyncMetricsSnapshot) => void>();
 
-  constructor(queueManager?: any, networkMonitor?: NetworkMonitor) {
-    this.queueManager = queueManager || null;
-    this.networkMonitor = networkMonitor || null;
+  start(): void {
+    if (this.unsubscribe) return;
+    this.unsubscribe = SyncVault.addEventListener((event) => this.record(event));
   }
 
-  /**
-   * Record sync event
-   */
-  recordSyncEvent(
-    type: SyncEventType,
-    value: number,
-    metadata?: Record<string, any>
-  ): void {
-    this.metricsCollector.recordEvent({ type, value, metadata });
+  stop(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
   }
 
-  /**
-   * Get current queue size
-   */
-  async getQueueSize(): Promise<number> {
-    if (!this.queueManager) {
-      return 0;
-    }
-    try {
-      const pending = await this.queueManager.getPendingRequests(1000, 0);
-      return pending.length;
-    } catch (error) {
-      return 0;
-    }
-  }
-
-  /**
-   * Get oldest queued item age (in milliseconds)
-   */
-  async getOldestQueuedItemAge(): Promise<number | null> {
-    if (!this.queueManager) {
-      return null;
-    }
-    try {
-      const pending = await this.queueManager.getPendingRequests(1, 0);
-      if (pending.length === 0) {
-        return null;
+  record(event: SyncEvent): void {
+    switch (event.type) {
+      case 'enqueued':
+        this.counters.enqueued++;
+        break;
+      case 'attempt':
+        this.counters.attempts++;
+        if (event.id && !this.firstAttemptAt.has(event.id)) this.firstAttemptAt.set(event.id, event.timestamp);
+        break;
+      case 'succeeded': {
+        this.counters.succeeded++;
+        const started = event.id ? this.firstAttemptAt.get(event.id) : undefined;
+        if (started != null) {
+          this.totalDeliveryMs += event.timestamp - started;
+          this.deliveries++;
+          this.firstAttemptAt.delete(event.id!);
+        }
+        break;
       }
-      const oldest = pending[0];
-      return Date.now() - (oldest.createdAt || Date.now());
-    } catch (error) {
-      return null;
+      case 'retry_scheduled':
+        this.counters.retries++;
+        break;
+      case 'dead_lettered':
+        this.counters.deadLettered++;
+        if (event.id) this.firstAttemptAt.delete(event.id);
+        break;
+      case 'conflict':
+        this.counters.conflicts++;
+        break;
+      case 'auth_blocked':
+        this.counters.authBlocked++;
+        break;
+      case 'drain_finished':
+        this.lastDrainAt = event.timestamp;
+        break;
+      default:
+        return;
     }
+    const snapshot = this.getSnapshot();
+    for (const listener of Array.from(this.listeners)) listener(snapshot);
   }
 
-  /**
-   * Get network quality
-   */
-  getNetworkQuality(): string {
-    if (!this.networkMonitor) {
-      return 'unknown';
-    }
-    return this.networkMonitor.getStatus();
-  }
-
-  /**
-   * Get comprehensive metrics
-   */
-  async getMetrics(): Promise<{
-    queueSize: number;
-    oldestQueuedItem: string | null; // Human-readable age
-    cacheHitRate: number;
-    syncSuccessRate: number;
-    averageSyncTime: number;
-    lastSyncAt: Date | null;
-    networkQuality: string;
-  }> {
-    const queueSize = await this.getQueueSize();
-    const oldestAge = await this.getOldestQueuedItemAge();
-    const summary = this.metricsCollector.getSummary();
-
-    // Format oldest item age
-    let oldestQueuedItem: string | null = null;
-    if (oldestAge !== null) {
-      const hours = Math.floor(oldestAge / (1000 * 60 * 60));
-      const minutes = Math.floor((oldestAge % (1000 * 60 * 60)) / (1000 * 60));
-      if (hours > 0) {
-        oldestQueuedItem = `${hours}h ${minutes}m`;
-      } else {
-        oldestQueuedItem = `${minutes}m`;
-      }
-    }
-
+  getSnapshot(): SyncMetricsSnapshot {
+    const settled = this.counters.succeeded + this.counters.deadLettered;
     return {
-      queueSize,
-      oldestQueuedItem,
-      cacheHitRate: summary.cacheHitRate,
-      syncSuccessRate: summary.syncSuccessRate,
-      averageSyncTime: summary.averageSyncTime,
-      lastSyncAt: summary.lastSyncAt ? new Date(summary.lastSyncAt) : null,
-      networkQuality: this.getNetworkQuality(),
+      ...this.counters,
+      successRate: settled === 0 ? 1 : this.counters.succeeded / settled,
+      averageDeliveryMs: this.deliveries === 0 ? 0 : this.totalDeliveryMs / this.deliveries,
+      lastDrainAt: this.lastDrainAt,
+      since: this.since,
     };
   }
 
-  /**
-   * Reset all metrics
-   */
+  subscribe(listener: (snapshot: SyncMetricsSnapshot) => void): () => void {
+    this.start();
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
   reset(): void {
-    this.metricsCollector.reset();
+    this.counters = { enqueued: 0, succeeded: 0, deadLettered: 0, conflicts: 0, retries: 0, authBlocked: 0, attempts: 0 };
+    this.firstAttemptAt.clear();
+    this.totalDeliveryMs = 0;
+    this.deliveries = 0;
+    this.lastDrainAt = null;
+    this.since = Date.now();
   }
 }
 
-export default SyncMetrics;
+let shared: SyncMetrics | null = null;
 
+export function getSyncMetrics(): SyncMetrics {
+  if (!shared) shared = new SyncMetrics();
+  return shared;
+}
+
+export default SyncMetrics;

@@ -4,733 +4,499 @@
 [![total downloads](https://img.shields.io/npm/dt/react-native-sync-vault?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/react-native-sync-vault)
 [![weekly downloads](https://img.shields.io/npm/dw/react-native-sync-vault?style=for-the-badge&logo=npm&color=cb3837)](https://www.npmjs.com/package/react-native-sync-vault)
 
-A reliable offline-first sync vault for persistent network operations in React Native. Queue API requests offline, persist them in SQLite, and progressively sync when online. Failed requests are never lost.
+A durable, native outbox for React Native. Mutations you hand to Sync Vault are committed to SQLite on the device and delivered to your server **at least once, applied exactly once**: they survive offline periods, app kills, crashes, and reboots, and they keep syncing in the background without a JavaScript runtime.
 
-**NEW in v1.2.0+**: 
-- ✨ Automatic API interception - intercepts `fetch()` and `axios()` calls automatically
-- ⚡ Event-based reactive updates - hooks use event listeners instead of polling
-- 🧠 Smart caching with intelligent invalidation
-- 🔋 Resource-aware sync (battery & network quality)
-- 🔄 Background sync guarantees
-- 🎨 Pre-built UI components
-- 📊 Sync metrics & dashboard
-- 🔌 Basic integrations (React Query, Zustand, Redux) - *Note: Basic adapters, manual integration required*
+v2 is a rewrite. The delivery engine now lives entirely in native code (Kotlin on Android, Swift on iOS) behind a single [Turbo Module](https://reactnative.dev/docs/turbo-native-modules-introduction), and both platforms implement the same state machine, retry policy, and SQL schema. JavaScript only configures the engine, enqueues requests, and listens to events.
 
 📹 **Demo Video**: [Watch on YouTube](https://www.youtube.com/watch?v=Gs1bcV6Zw3k)
 
-## Quick Start
+## Contents
 
-```bash
-# Install
-npm install react-native-sync-vault
+- [Guarantees](#guarantees)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Core concepts](#core-concepts)
+- [Configuration](#configuration)
+- [API reference](#api-reference)
+- [Backend contract](#backend-contract)
+- [Testing](#testing)
+- [Migrating from v1](#migrating-from-v1)
+- [Example app](#example-app)
+- [Development](#development)
 
-# Setup (optional - automated setup tool)
-npx sync-vault-init
+## Guarantees
+
+| Guarantee | How |
+| --- | --- |
+| A request is never lost once `enqueue()` resolves | It resolves only after the row is committed to SQLite (WAL mode) on the native DB queue. |
+| Applied exactly once on the server | Every request carries an `Idempotency-Key` (UUIDv7) that stays the same across all retries; the server replays the stored response for duplicates. |
+| Ordered per entity | Requests sharing a `queueKey` are delivered strictly one after another, in enqueue order. |
+| Newest change wins | A newer request with the same `dedupeKey` replaces a pending older one, and an older body can never overwrite a newer one. |
+| Crash-safe in-flight work | In-flight rows hold a lease. After a crash the lease expires and the row is retried with the same idempotency key, or dead-lettered if that was its last attempt. |
+| Delivery without JS | WorkManager (Android) and BGTaskScheduler plus a background `URLSession` (iOS) drain the queue while the app is suspended or killed. |
+| Token refresh doesn't burn retries | A 401 parks the request, asks JS for fresh headers, and refunds the attempt. |
+| Conflicts are surfaced, not overwritten | 409/412 move the request to `conflict` with the server's body and version, for your resolver or UI. |
+
+These guarantees are verified by one shared contract suite. It runs in Jest against the in-memory engine, and on device against the real Kotlin and Swift engines (see [Testing](#testing)).
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph JS["JavaScript"]
+    App["Your app<br/>SyncVault.enqueue()"]
+    Hooks["Hooks / UI<br/>useSyncStatus, useRequests"]
+  end
+  subgraph Native["Native engine (Kotlin / Swift)"]
+    TM["Turbo Module<br/>NativeSyncVault"]
+    DB[("SQLite outbox<br/>WAL, single writer")]
+    Drain["Drain loop<br/>lease → send → classify"]
+    BG["Background<br/>WorkManager / BGTaskScheduler"]
+    Net["Connectivity<br/>ConnectivityManager / NWPathMonitor"]
+  end
+  Server["Your API<br/>(backend contract)"]
+
+  App -->|enqueue| TM --> DB
+  DB --> Drain -->|HTTP + Idempotency-Key| Server
+  Server -->|status, Retry-After, ETag| Drain --> DB
+  Net --> Drain
+  BG --> Drain
+  TM -->|typed events| Hooks
 ```
 
-```typescript
-import { useOfflineQueue } from 'react-native-sync-vault';
+1. `SyncVault.enqueue()` serializes the request and hands it to the Turbo Module, which inserts it into the outbox in one transaction and returns its id.
+2. The drain loop claims eligible rows. A row is eligible when it is `pending`, its retry time has passed, it isn't blocked on auth, and no older unfinished row shares its `queueKey` or `dedupeKey`. Claiming takes a lease and moves the row to `inflight`.
+3. The response is classified with the same table on every platform, and the row moves to its next state in a single transaction.
+4. Events (`enqueued`, `attempt`, `succeeded`, `retry_scheduled`, …) are emitted to JS when a JS runtime is attached; hooks update from them without polling.
+5. When the app is in the background or killed, the platform scheduler wakes the engine at the next retry time and when connectivity returns.
 
-function MyComponent() {
-  const queue = useOfflineQueue({
-    baseUrl: 'https://api.example.com',
-    interceptor: { enabled: true }, // Automatically intercept fetch()
-  });
+### Request lifecycle
 
-  const handleSubmit = async () => {
-    // Just use fetch() - automatically queued if offline!
-    const response = await fetch('https://api.example.com/api/users', {
-      method: 'POST',
-      body: JSON.stringify({ name: 'John' }),
-    });
-  };
-}
+```mermaid
+stateDiagram-v2
+  [*] --> pending: enqueue
+  pending --> inflight: claimed (lease)
+  inflight --> succeeded: 2xx
+  inflight --> pending: 408 / 425 / 429 / 5xx / network error (backoff)
+  inflight --> pending: 401 (auth_blocked, attempt refunded)
+  inflight --> conflict: 409 / 412
+  inflight --> dead_letter: other 4xx, or attempts exhausted
+  inflight --> pending: lease expired (crash)
+  conflict --> pending: resolveConflict (keep_local / merge)
+  conflict --> succeeded: resolveConflict (keep_server)
+  dead_letter --> pending: retry()
+  succeeded --> [*]
+  dead_letter --> [*]: discard()
 ```
 
-## What it is NOT
+| Response | Outcome | What happens |
+| --- | --- | --- |
+| `2xx` | success | `succeeded`; kept for 7 days for inspection, then purged. |
+| `401` | auth | Parked as `authBlocked`, JS is asked for new headers, the attempt is refunded. |
+| `409`, `412` | conflict | `conflict` with the server body and `ETag`; resolved by strategy, resolver, or UI. |
+| `408`, `425`, `429`, `5xx`, network error | retryable | Back to `pending` at `now + max(Retry-After, backoff)`. |
+| any other `4xx` | permanent | `dead_letter` immediately; never retried automatically. |
 
-- ❌ A full-featured database with relationships (like WatermelonDB)
-- ❌ A general-purpose cache (like React Query cache)
-- ❌ An ORM or database abstraction layer
-- ❌ A state management library (like Redux or Zustand)
-- ❌ A polling-based system - uses event-driven architecture
+Backoff is exponential with full jitter: `random(0, min(retryMaxDelayMs, retryBaseDelayMs × 2^(attempt−1)))`. `Retry-After` is honoured in both delta-seconds and HTTP-date form. After `maxAttempts` retryable failures the request is dead-lettered.
 
-## What it IS
+### Platform features
 
-- ✅ A reliable network operation queue
-- ✅ Offline-first request persistence
-- ✅ Progressive sync engine
-- ✅ Failure persistence and retry logic
-- ✅ Custom native network monitoring (no external dependencies)
-- ✅ **Automatic API interception** - Automatically intercepts `fetch()` and `axios()` calls and queues them when offline
-- ✅ **Event-based reactive updates** - Hooks use event listeners for instant UI updates without polling
-- ✅ Smart caching with intelligent invalidation
-- ✅ Resource-aware sync (battery & network quality detection)
+| | Android | iOS |
+| --- | --- | --- |
+| Storage | SQLite (WAL) in `noBackupFilesDir` | SQLite (WAL), file protection `completeUntilFirstUserAuthentication`, excluded from backup |
+| Connectivity | `ConnectivityManager` network callbacks | `NWPathMonitor` |
+| Background drain | WorkManager: expedited one-time work, delayed work at the next retry time, periodic work | `BGProcessingTask` + `BGAppRefreshTask`, `beginBackgroundTask` to finish an in-progress drain |
+| Large payloads | Stored as files, uploaded by a `dataSync` foreground service | Stored as files, uploaded by a background `URLSession` that continues after the app is killed |
+| Encryption at rest (opt-in) | AES-256-GCM, non-exportable Android Keystore key | AES-256-GCM, Keychain key (`AfterFirstUnlockThisDeviceOnly`) |
+| HTTP | OkHttp | `URLSession` |
 
-## Features
+## Requirements
 
-### Core Features
-- ✅ **Offline Request Queue** - Queue API requests when offline
-- ✅ **Automatic API Interception** - Intercepts `fetch()` calls automatically
-- ✅ **SQLite Persistence** - Requests persisted in native SQLite
-- ✅ **Progressive Sync** - Automatic sync when network is restored
-- ✅ **Conflict Resolution** - Built-in conflict resolution strategies
-- ✅ **Retry Logic** - Automatic retry with exponential backoff
-- ✅ **Native Network Monitoring** - No external dependencies
-
-### Smart Caching
-- ✅ **Intelligent Cache** - Per-endpoint TTL strategies
-- ✅ **Pattern-Based Invalidation** - Automatic cache invalidation on mutations
-- ✅ **Stale-While-Revalidate** - Return cached data while fetching fresh
-- ✅ **Multiple Cache Strategies** - Cache-first, network-first, stale-while-revalidate
-
-### Resource-Aware Sync
-- ✅ **Battery Monitoring** - Reduces sync when battery is low
-- ✅ **Network Quality Detection** - Defers large uploads on cellular
-- ✅ **Priority-Based Queue** - Critical items sync first
-- ✅ **Dynamic Batch Sizing** - Adjusts based on available resources
-
-### Background Sync
-- ✅ **Background Guarantees** - Sync survives app kill
-- ✅ **Task Scheduling** - Platform-specific background tasks (iOS/Android)
-- ✅ **Retry Policies** - Configurable retry with exponential backoff
-
-### Developer Experience
-- ✅ **React Hooks** - Easy-to-use React hooks
-- ✅ **UI Components** - Pre-built offline status indicators
-- ✅ **Offline-Ready Hooks** - React Query-like API (`useOfflineQuery`, `useOfflineMutation`)
-- ✅ **Sync Metrics** - Track cache hit rates, sync success, and performance
-- ✅ **Debug Tools** - Built-in debug screen, logger, and dashboard
-- ✅ **TypeScript** - Full TypeScript support
-
-### Integrations
-- ⚠️ **React Query** - Basic adapter hook (manual integration required)
-- ⚠️ **Zustand** - Basic hook to add sync vault to store (manual usage)
-- ✅ **Redux** - Middleware for queuing Redux actions with API metadata
-
-## Documentation
-
-- 📚 [API Reference](docs/API_REFERENCE.md) - Complete API documentation
-- 🔄 [Migration Guide](docs/MIGRATION.md) - Migrate from other solutions
-- ⚡ [Performance Benchmarks](docs/PERFORMANCE_BENCHMARKS.md) - Performance metrics
-- 🛠️ [Error Handling](docs/ERROR_HANDLING.md) - Error handling guide
-- 📋 [API Stability](docs/API_STABILITY.md) - API stability policy
-- 🚀 [Examples](examples/) - Example applications
+- React Native **0.76+** with the **New Architecture** enabled (the default in 0.76). The legacy bridge is not supported.
+- React 18+.
+- iOS 15.1+, Android API 24+.
 
 ## Installation
 
 ```bash
 npm install react-native-sync-vault
-# or
-yarn add react-native-sync-vault
-```
-
-### iOS Setup
-
-```bash
+npx sync-vault-init        # patches Info.plist and checks AndroidManifest.xml (--dry-run to preview)
 cd ios && pod install
 ```
 
-### Android Setup
+### iOS
 
-Add network permission to `AndroidManifest.xml`:
+`sync-vault-init` adds these keys to your app's `Info.plist`; add them by hand if you don't use the CLI:
 
 ```xml
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+<key>BGTaskSchedulerPermittedIdentifiers</key>
+<array>
+  <string>com.syncvault.drain</string>
+  <string>com.syncvault.refresh</string>
+</array>
+<key>UIBackgroundModes</key>
+<array>
+  <string>processing</string>
+  <string>fetch</string>
+</array>
 ```
 
-**Note:** The library uses autolinking, so no additional Gradle configuration is needed.
+Background task handlers are registered by the library at process start, so no extra code is needed for them. To record large uploads that finish while the app is suspended or killed, forward the background `URLSession` callback in `AppDelegate.mm`:
 
-## Usage
+```objc
+#import <react-native-sync-vault/SyncVaultAppDelegate.h>
 
-### Basic Usage (Manual Queuing)
-
-```typescript
-import { useOfflineQueue } from 'react-native-sync-vault';
-
-function MyComponent() {
-  const queue = useOfflineQueue('https://api.example.com');
-
-  const handleSubmit = async () => {
-    try {
-      const requestId = await queue.push({
-        method: 'POST',
-        url: '/api/users',
-        data: { name: 'John Doe', email: 'john@example.com' },
-        priority: 1,
-      });
-      console.log('Request queued:', requestId);
-    } catch (error) {
-      console.error('Failed to queue request:', error);
-    }
-  };
-
-  return <Button onPress={handleSubmit} title="Submit" />;
+- (void)application:(UIApplication *)application
+    handleEventsForBackgroundURLSession:(NSString *)identifier
+                      completionHandler:(void (^)(void))completionHandler
+{
+  [SyncVaultAppDelegate handleEventsForBackgroundURLSession:identifier completionHandler:completionHandler];
 }
 ```
 
-### Automatic Interception (Recommended)
+> **Xcode 26+ with React Native 0.76:** the bundled `fmt` 11.0.2 pod doesn't compile as C++20 with newer clang. Add this to the `post_install` block of your `Podfile`:
+>
+> ```ruby
+> installer.pods_project.targets.each do |target|
+>   next unless target.name == 'fmt'
+>   target.build_configurations.each { |c| c.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++17' }
+> end
+> ```
 
-Enable automatic `fetch()` and `axios()` interception - no need to manually queue requests. Queued requests automatically trigger events for reactive UI updates.
+### Android
 
-```typescript
-import { useOfflineQueue } from 'react-native-sync-vault';
-import axios from 'axios';
+Nothing to add: autolinking registers the module, and the library manifest merges `INTERNET`, `ACCESS_NETWORK_STATE`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, and the WorkManager foreground service with `foregroundServiceType="dataSync"`. `sync-vault-init` warns if your app manifest removes any of them with `tools:node="remove"`.
 
-function MyComponent() {
-  // Enable automatic interception for both fetch() and axios()
-  const queue = useOfflineQueue({
-    baseUrl: 'https://api.example.com',
-    interceptor: {
-      enabled: true, // Enable fetch() interception
-      urlFilter: ['https://api.example.com'], // Optional: only intercept these URLs
-      axios: {
-        enabled: true, // Enable axios() interception
-        // instance: axios, // Optional: use custom axios instance
-      },
-    },
-  });
+## Quick start
 
-  const handleSubmitWithFetch = async () => {
-    // Just use fetch() normally - it's automatically intercepted!
-    try {
-      const response = await fetch('https://api.example.com/api/users', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ 
-          name: 'John Doe', 
-          email: 'john@example.com' 
-        }),
-      });
+Configure the engine **once, at app start, outside React** (for example in `index.js`). Background launches on iOS and Android may start your JS without mounting any component.
 
-      if (response.status === 202) {
-        // Request was queued (device is offline)
-        // Events are automatically emitted: queue:request:added
-        console.log('Request queued for offline sync');
-      } else {
-        // Request executed normally (device is online)
-        const data = await response.json();
-        console.log('Request successful:', data);
-      }
-    } catch (error) {
-      console.error('Request failed:', error);
-    }
-  };
+```ts
+// index.js
+import { SyncVault } from 'react-native-sync-vault';
+import { tokenStore } from './auth';
 
-  const handleSubmitWithAxios = async () => {
-    // Just use axios() normally - it's automatically intercepted!
-    try {
-      const response = await axios.post('https://api.example.com/api/users', {
-        name: 'John Doe',
-        email: 'john@example.com'
-      });
-
-      if (response.status === 202) {
-        // Request was queued (device is offline)
-        // Events are automatically emitted: queue:request:added
-        console.log('Request queued for offline sync');
-      } else {
-        // Request executed normally (device is online)
-        console.log('Request successful:', response.data);
-      }
-    } catch (error: any) {
-      // Check if it's a queued error
-      if (error.isQueued && error.status === 202) {
-        console.log('Request queued for offline sync', error.requestId);
-      } else {
-        console.error('Request failed:', error);
-      }
-    }
-  };
-
-  return (
-    <View>
-      <Button onPress={handleSubmitWithFetch} title="Submit with Fetch" />
-      <Button onPress={handleSubmitWithAxios} title="Submit with Axios" />
-    </View>
-  );
-}
-```
-
-**Note:** All hooks (`useQueueStatus`, `usePendingRequests`, `useFailedRequests`) use event listeners for reactive updates. When requests are queued via interception, events are automatically emitted and your UI updates immediately - no polling required!
-
-### Monitor Queue Status
-
-All status hooks use **event-based reactive updates** instead of polling. When requests are queued (via `fetch()`, `axios()`, or manual `queue.push()`), events are automatically emitted and your UI updates immediately.
-
-```typescript
-import { useQueueStatus, usePendingRequests, useFailedRequests } from 'react-native-sync-vault';
-import axios from 'axios';
-
-function QueueStatus() {
-  const { status, loading } = useQueueStatus();
-  const { pendingRequests } = usePendingRequests();
-  const { failedRequests, retry } = useFailedRequests();
-
-  // Example: When axios request is queued offline, events trigger automatically:
-  // - queue:request:added event is emitted
-  // - usePendingRequests hook updates reactively
-  // - useQueueStatus hook updates reactively
-  // No polling or manual refresh needed!
-
-  const handleAxiosRequest = async () => {
-    try {
-      await axios.post('https://api.example.com/api/data', { name: 'Test' });
-    } catch (error: any) {
-      if (error.isQueued) {
-        // Request was queued - UI will update automatically via events
-        console.log('Request queued, UI will update automatically');
-      }
-    }
-  };
-
-  return (
-    <View>
-      <Text>Network: {status?.networkStatus}</Text>
-      <Text>Pending: {status?.totalPending}</Text>
-      <Text>Failed: {status?.totalFailed}</Text>
-      
-      {/* These lists update automatically when events are emitted */}
-      {pendingRequests.map((request) => (
-        <View key={request.id}>
-          <Text>{request.method} {request.url}</Text>
-        </View>
-      ))}
-      
-      {failedRequests.map((request) => (
-        <View key={request.id}>
-          <Text>{request.errorMessage}</Text>
-          <Button onPress={() => retry(request.requestId)} title="Retry" />
-        </View>
-      ))}
-    </View>
-  );
-}
-```
-
-**Event-Based Updates:** Hooks subscribe to events like `queue:request:added`, `queue:request:synced`, `queue:pending:changed`, and `sync:started` for instant, reactive updates without polling.
-
-### Event System
-
-The sync vault uses an event-based architecture for reactive updates. When requests are queued (via `fetch()`, `axios()`, or `queue.push()`), events are automatically emitted. All hooks subscribe to these events for instant UI updates.
-
-**Available Events:**
-
-- `queue:request:added` - Emitted when a request is added to the queue
-- `queue:request:synced` - Emitted when a request is successfully synced
-- `queue:request:failed` - Emitted when a request fails to sync
-- `queue:status:changed` - Emitted when request status changes
-- `queue:pending:changed` - Emitted when pending requests list changes
-- `queue:failed:changed` - Emitted when failed requests list changes
-- `sync:started` - Emitted when sync process starts
-- `sync:completed` - Emitted when sync process completes
-- `sync:failed` - Emitted when sync process fails
-- `sync:batch:completed` - Emitted when a sync batch completes
-
-**Listening to Events Directly:**
-
-```typescript
-import QueueManager from 'react-native-sync-vault';
-
-// Listen to events
-QueueManager.on('queue:request:added', ({ requestId, request }) => {
-  console.log('Request queued:', requestId, request.method, request.url);
+SyncVault.configure({
+  baseUrl: 'https://api.example.com',
+  // Called at configure time and on every 401; headers are stored natively and
+  // attached at send time, so a refreshed token applies to already-queued requests.
+  getAuthHeaders: async () => ({ Authorization: `Bearer ${await tokenStore.freshToken()}` }),
+  conflictResolver: (conflict) => ({ action: 'keep_server' }),
+  onEvent: (event) => logger.debug('sync', event),
 });
-
-QueueManager.on('queue:request:synced', ({ requestId }) => {
-  console.log('Request synced:', requestId);
-});
-
-QueueManager.on('sync:started', () => {
-  console.log('Sync started');
-});
-
-QueueManager.on('sync:completed', () => {
-  console.log('Sync completed');
-});
-
-// Clean up listeners
-QueueManager.off('queue:request:added', handler);
 ```
 
-**Note:** Hooks automatically subscribe to these events, so you typically don't need to listen directly unless you're building custom integrations.
+Queue mutations with client-generated IDs, and update the UI optimistically:
 
-### Smart Caching
+```ts
+import { SyncVault } from 'react-native-sync-vault';
 
-Enable intelligent caching with per-endpoint strategies:
-
-```typescript
-import { useOfflineQueue } from 'react-native-sync-vault';
-
-function MyComponent() {
-  const queue = useOfflineQueue({
-    baseUrl: 'https://api.example.com',
-    cache: {
-      enabled: true,
-      defaultTtl: 8 * 60 * 60, // 8 hours
-      strategies: {
-        '/api/assignments': { 
-          ttl: 24 * 60 * 60, // 24h for critical data
-          staleWhileRevalidate: true 
-        },
-      },
-      invalidateOnMutate: {
-        'POST /api/assignments': ['/api/assignments', '/api/assignments/*'],
-      }
-    }
+async function addTodo(title: string) {
+  const todo = { id: SyncVault.generateId(), title, done: false }; // UUIDv7
+  setTodos((list) => [...list, todo]);                             // optimistic
+  await SyncVault.enqueue({
+    method: 'POST',
+    url: '/todos',
+    body: todo,
+    queueKey: `todo:${todo.id}`,  // create → update → delete stay in order
   });
-
-  // GET requests are automatically cached
-  const response = await fetch('https://api.example.com/api/assignments');
 }
-```
 
-### Resource-Aware Sync
-
-Optimize sync based on device resources:
-
-```typescript
-import { useOfflineQueue } from 'react-native-sync-vault';
-
-function MyComponent() {
-  const queue = useOfflineQueue({
-    baseUrl: 'https://api.example.com',
-    resourceAware: {
-      battery: { 
-        lowThreshold: 20,
-        action: 'defer_non_critical',
-        criticalOnly: true
-      },
-      network: { 
-        qualityAware: true,
-        deferLargeUploadsOnCellular: true,
-        maxPayloadSizeOnCellular: 100 * 1024 // 100KB
-      }
-    }
+async function toggleTodo(todo: Todo) {
+  await SyncVault.enqueue({
+    method: 'PATCH',
+    url: `/todos/${todo.id}`,
+    body: { done: !todo.done },
+    queueKey: `todo:${todo.id}`,
+    dedupeKey: `todo:${todo.id}:done`, // rapid taps collapse into one request
   });
 }
 ```
 
-### Background Sync Guarantees
+Show sync state anywhere:
 
-Ensure critical operations complete even after app kill:
+```tsx
+import { useSyncStatus, useFailedRequests } from 'react-native-sync-vault';
 
-```typescript
-import { useBackgroundSync } from 'react-native-sync-vault';
+function SyncBadge() {
+  const { isOnline, pendingCount, counts, isDraining } = useSyncStatus();
+  return <Text>{isOnline ? 'online' : 'offline'} · {pendingCount} pending · {counts.deadLetter} failed</Text>;
+}
 
-function MyComponent() {
-  const { guarantee } = useBackgroundSync();
-
-  const handleCriticalSubmit = async () => {
-    await guarantee({
-      taskId: 'submit-inspection-123',
-      operation: () => queue.sync(),
-      requiredNetwork: true,
-      priority: 'high',
-      retryPolicy: {
-        maxAttempts: 3,
-        backoff: 'exponential'
-      }
-    });
-  };
+function FailedList() {
+  const { requests, retry, discard } = useFailedRequests();
+  return requests.map((r) => (
+    <Row key={r.id} title={`${r.method} ${r.url}`} subtitle={r.lastError} onRetry={() => retry(r.id)} onDiscard={() => discard(r.id)} />
+  ));
 }
 ```
 
-### Offline-Ready Hooks (React Query-like API)
+## Core concepts
 
-Use familiar React Query patterns:
+### Idempotency keys
 
-```typescript
-import { useOfflineQuery, useOfflineMutation } from 'react-native-sync-vault';
+Each request gets an `Idempotency-Key` header, defaulting to its UUIDv7 id. The key never changes across retries, so a request whose response was lost is replayed by the server instead of applied twice. Pass `idempotencyKey` to reuse a key you already have. The key is rotated only when the payload changes after it may already have been sent: on coalescing (see below) and on conflict resolution.
 
-function MyComponent() {
-  const { data, isLoading, isStale } = useOfflineQuery('/api/assignments', {
-    ttl: 8 * 60 * 60 * 1000,
-    staleWhileRevalidate: true
-  });
+### Ordering with `queueKey`
 
-  const { mutate, isPending } = useOfflineMutation({
-    fn: (data) => fetch('/api/assignments', { 
-      method: 'POST', 
-      body: JSON.stringify(data) 
-    }),
-    invalidateOnSuccess: ['/api/assignments']
-  });
+Requests with the same `queueKey` are delivered strictly in enqueue order; a later request waits until the earlier one reaches a terminal state or a conflict. Requests with different keys (or no key) are sent in parallel, up to `maxConcurrency`. Use one key per entity, such as `todo:<id>`.
 
-  return (
-    <View>
-      {isLoading && <Text>Loading...</Text>}
-      {data && <Text>{JSON.stringify(data)}</Text>}
-      <Button onPress={() => mutate({ title: 'New Assignment' })} title="Create" />
-    </View>
-  );
-}
+### Coalescing with `dedupeKey`
+
+When a request with a `dedupeKey` is enqueued and the newest unfinished request with that key is still `pending`, its body is replaced instead of a second row being added. If the newest one is already in flight or in conflict, the new request is queued behind it, so an older body can never overwrite a newer one on the server.
+
+### Client-generated IDs
+
+Create records offline with `SyncVault.generateId()` (RFC 9562 UUIDv7, time-ordered). Your server should accept the client ID as the primary key, which makes creates naturally idempotent and lets follow-up updates reference the record before it exists on the server.
+
+### Authentication
+
+Provide `getAuthHeaders` instead of baking tokens into queued requests. Headers are stored natively and attached at send time. On a 401 the request is parked (`authBlocked`) without spending an attempt, JS is asked once for fresh headers (single-flight), and all parked requests resume. If JS isn't running, requests stay parked until the next `configure()` or `setAuthHeaders()`.
+
+### Conflicts
+
+A `409` or `412` moves the request to `conflict` and stores the server's body and `ETag`. What happens next depends on the request's `conflictStrategy`:
+
+| Strategy | Behaviour |
+| --- | --- |
+| `manual` (default) | Stays in `conflict` until `conflictResolver` or your UI calls `resolveConflict()`. |
+| `client_wins` | Resent natively with the server's version as `If-Match`. |
+| `server_wins` | The local change is dropped. |
+| `merge` | Your `merge(local, server)` function (or the global resolver) runs in JS; the result is sent with the server's version as `If-Match`. |
+
+`resolveConflict(id, { action: 'keep_local' | 'keep_server' | 'merge', payload })` persists the resolved payload natively with a new idempotency key and a fresh attempt budget, so the resolution survives an app kill. Conflicts produced by background drains are handed to `conflictResolver` the next time `configure()` runs.
+
+### Dead letters
+
+Permanent failures and requests that run out of attempts move to `dead_letter`. They're never retried automatically; use `retry(id)`, `retryAllDeadLetters()`, or `discard(id)`, or the `useFailedRequests()` hook.
+
+### Background delivery
+
+`configure()` schedules a periodic background drain every `backgroundIntervalMinutes` (default 15; `0` disables it). Independently of that, the engine schedules a one-time wake-up for the next retry time and drains when connectivity returns. The OS decides the exact timing, especially on iOS, where `BGTaskScheduler` runs tasks opportunistically.
+
+### Resource constraints
+
+`wifiOnly`, `requiresCharging`, and `minBatteryLevel` pause draining (not enqueuing) until the condition holds; they also constrain the background scheduler.
+
+## Configuration
+
+All options are optional. `configure()` can be called again to change settings; the configuration is persisted natively so background workers use it without JS.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `baseUrl` | `''` | Relative request URLs are resolved against this at send time. |
+| `maxConcurrency` | `4` | Parallel requests across different `queueKey`s. |
+| `requestTimeoutMs` | `30000` | Per-request timeout. |
+| `leaseMs` | `120000` | Minimum in-flight lease; extended to `2 × timeout + 10s`. |
+| `maxAttempts` | `8` | Retryable attempts before dead-lettering (per-request override available). |
+| `retryBaseDelayMs` | `1000` | Backoff base. |
+| `retryMaxDelayMs` | `300000` | Backoff cap. |
+| `encryptPayloads` | `false` | Encrypt stored bodies and headers with a device-bound key. |
+| `wifiOnly` | `false` | Only drain on unmetered networks. |
+| `requiresCharging` | `false` | Only drain while charging. |
+| `minBatteryLevel` | `0` | `0..1`; below this (and not charging) draining pauses. |
+| `backgroundIntervalMinutes` | `15` | Periodic background drain; `0` disables. |
+| `largePayloadThresholdBytes` | `262144` | Bodies above this are stored as files and uploaded in the background. |
+| `notificationTitle` | `'Syncing'` | Android foreground-service notification title for large uploads. |
+| `getAuthHeaders(context)` | – | Returns headers; called at configure time, on 401, and on `refreshAuth()`. |
+| `conflictResolver(conflict)` | – | Returns a `ConflictResolution` for `manual` and `merge` requests. |
+| `onEvent(event)` | – | Every engine event, for logging or monitoring. |
+| `onError(error, context)` | – | Errors thrown by your providers, resolvers, and listeners. |
+
+### Enqueue options
+
+| Option | Description |
+| --- | --- |
+| `method`, `url` | Required. `url` may be absolute or relative to `baseUrl`. |
+| `body` | Objects are JSON-serialized; strings are sent as-is. `FormData`, `Blob`, and binary bodies must be serialized first. |
+| `headers`, `queryParams`, `contentType` | Sent with the request. |
+| `idempotencyKey` | Defaults to the request id. |
+| `queueKey` | Strict per-key ordering. |
+| `dedupeKey` | Newest pending change replaces older ones. |
+| `ifMatch` | Sent as `If-Match` for optimistic concurrency. |
+| `priority` | Higher first (default `0`), within ordering constraints. |
+| `maxAttempts` | Overrides the global value. |
+| `conflictStrategy`, `merge` | See [Conflicts](#conflicts). `merge` functions live in memory, so a request whose process died falls back to `conflictResolver`. |
+| `metadata` | Arbitrary JSON stored with the request. |
+
+## API reference
+
+### `SyncVault`
+
+| Method | Description |
+| --- | --- |
+| `configure(config)` | Persist config, install auth/conflict handlers, schedule background drain, start draining. |
+| `enqueue(options)` | Durably queue a request; resolves with its id after commit. |
+| `generateId()` | UUIDv7 for client-generated primary keys. |
+| `getRequests({ status, queueKey, limit, offset })`, `getRequest(id)` | Inspect the outbox. |
+| `getPending()`, `getDeadLetters()`, `getConflicts()`, `getCounts()` | Shortcuts. |
+| `retry(id)`, `retryAllDeadLetters()`, `discard(id)`, `purgeSucceeded(olderThanMs)` | Manage requests. |
+| `resolveConflict(id, resolution)` | Resolve a request in `conflict`. |
+| `setAuthHeaders(headers)`, `refreshAuth()` | Push credentials (e.g. after login) and unblock parked requests. |
+| `drainNow()` | Drain immediately (still subject to connectivity and constraints). |
+| `scheduleBackgroundDrain(options)`, `cancelBackgroundDrain()` | Control the periodic background drain. |
+| `getNetworkState()`, `getPowerState()` | Synchronous snapshots from native monitors. |
+| `addEventListener(fn)`, `addNetworkListener(fn)`, `addConflictListener(fn)` | Subscribe; each returns an unsubscribe function. |
+| `cache.get/set/delete/invalidate/clear/stats/evict` | Native response cache with TTL, tags, and LRU eviction. |
+
+Event types: `enqueued`, `coalesced`, `attempt`, `succeeded`, `retry_scheduled`, `dead_lettered`, `conflict`, `conflict_resolved`, `discarded`, `auth_blocked`, `drain_started`, `drain_finished`. Each event carries `id`, `status`, `attempt`, `httpStatus`, `error`, `nextAttemptAt`, and `timestamp`. Events are emitted only while a JS runtime is attached; anything that happened in the background is reflected in the outbox, which hooks re-read when they subscribe.
+
+### Hooks
+
+| Hook | Returns |
+| --- | --- |
+| `useSyncStatus()` | `counts`, `network`, `isOnline`, `pendingCount`, `isDraining`, `lastEvent`, `drainNow`, `retryAllDeadLetters` |
+| `useNetworkState()` | Current `NetworkState` |
+| `useRequests(query)` | Live list of requests matching a query |
+| `usePendingRequests()` | Pending and in-flight requests |
+| `useFailedRequests()` | Dead letters plus `retry`, `retryAll`, `discard` |
+| `useConflicts()` | Conflicts plus `resolve(id, resolution)` |
+| `useRequestStatus(id)` | One request, updated until it settles |
+| `useOfflineMutation({ request, invalidate, onQueued })` | `mutate(vars)` that queues durably, plus `isPending`, `lastRequestId` |
+| `useOfflineQuery(url, { fetcher, ttl, strategy, tags })` | Cached read that falls back to the last copy offline |
+| `useCache(key)` | Read and write one cache entry |
+| `useSyncMetrics()` | Success rate, latency, and queue metrics |
+| `useBackgroundSync()` | `schedule`, `cancel`, `drainNow` |
+
+All hooks subscribe to engine events through a shared store; none of them poll.
+
+### Interceptors
+
+If you'd rather keep calling `fetch` or axios, interceptors queue mutations (`POST`, `PUT`, `PATCH`, `DELETE` by default) when the device is offline or the request fails at the network level:
+
+```ts
+import { interceptFetch, interceptAxios } from 'react-native-sync-vault';
+
+const stopFetch = interceptFetch({ urlFilter: ['https://api.example.com'] });
+const stopAxios = interceptAxios(axiosInstance);
 ```
 
-### UI Components
+A queued call resolves with a synthetic `202` whose body is `{ queued: true, requestId }`. Every intercepted mutation gets an `Idempotency-Key` before its first attempt, so a request that fails online and is then queued can't be applied twice. Explicit `SyncVault.enqueue()` is still recommended because it lets you set `queueKey` and `dedupeKey`.
 
-Add pre-built UI components for offline status:
+### UI components
 
-```typescript
-import { 
-  OfflineProvider, 
-  OfflineStatusBar, 
-  QueuedActionsBadge,
-  SyncProgress 
-} from 'react-native-sync-vault';
-
-function App() {
-  return (
-    <OfflineProvider config={{ baseUrl: 'https://api.example.com' }}>
-      <OfflineStatusBar position="top" />
-      <YourAppContent />
-      <QueuedActionsBadge />
-      <SyncProgress />
-    </OfflineProvider>
-  );
-}
-```
-
-### Sync Metrics
-
-Track sync performance and health:
-
-```typescript
-import { useSyncMetrics } from 'react-native-sync-vault';
-
-function MetricsDashboard() {
-  const { metrics } = useSyncMetrics();
-
-  return (
-    <View>
-      <Text>Queue Size: {metrics.queueSize}</Text>
-      <Text>Cache Hit Rate: {metrics.cacheHitRate}%</Text>
-      <Text>Sync Success Rate: {metrics.syncSuccessRate}%</Text>
-      <Text>Average Sync Time: {metrics.averageSyncTime}ms</Text>
-    </View>
-  );
-}
-```
+`OfflineProvider`, `OfflineStatusBar`, `QueuedActionsBadge`, and `SyncProgress` render from `useSyncStatus()`. `DebugScreen`, `SyncDashboard`, and `QueueLogger` help during development.
 
 ### Integrations
 
-**⚠️ Important:** These integrations are basic adapters with limited functionality. They provide a starting point but require manual integration work for production use. Automatic mutation queuing, cache integration, and error handling are not included.
+```ts
+// TanStack Query: queue mutations and invalidate queries when they're delivered
+import { syncVaultMutationFn, withSyncVaultReactQuery } from 'react-native-sync-vault';
+useMutation({ mutationFn: syncVaultMutationFn((todo) => ({ method: 'POST', url: '/todos', body: todo })) });
+withSyncVaultReactQuery(queryClient, ({ url }) => [['todos']]);
 
-#### React Query Integration
+// Zustand: adds a `syncVault` slice with enqueue, drainNow, getCounts
+import { withSyncVaultZustand } from 'react-native-sync-vault';
+const useStore = create(withSyncVaultZustand((set, get) => ({ /* ... */ })));
 
-**Status:** Basic adapter - returns separate `queryClient` and `queue` objects. Manual integration required.
-
-The `useReactQueryWithSyncVault` hook returns both a QueryClient and queue instance, but they are not automatically connected. You'll need to manually integrate them:
-
-```typescript
-import { ReactQueryIntegration } from 'react-native-sync-vault/integrations';
-import { useMutation, useQuery } from '@tanstack/react-query';
-
-function MyComponent() {
-  const { queryClient, queue } = ReactQueryIntegration.useReactQueryWithSyncVault({
-    baseUrl: 'https://api.example.com'
-  });
-
-  // Manual integration example:
-  // You need to wrap your mutations to use the queue
-  const mutation = useMutation({
-    mutationFn: async (data) => {
-      // Check if offline and queue if needed
-      if (!queue.networkMonitor?.isOnline()) {
-        await queue.push({
-          method: 'POST',
-          url: '/api/todos',
-          data
-        });
-        return { queued: true };
-      }
-      // Otherwise make normal API call
-      return fetch('https://api.example.com/api/todos', {
-        method: 'POST',
-        body: JSON.stringify(data)
-      }).then(r => r.json());
-    }
-  });
-
-  // Note: Requires @tanstack/react-query to be installed
-  // Note: The withSyncVault function is non-functional (only stores config)
-}
+// Redux: actions with `meta.syncVault` are reduced optimistically and queued;
+// `${type}/queued` is dispatched with the request id, and engine events as `syncVault/event`
+import { createSyncVaultMiddleware } from 'react-native-sync-vault';
+const store = createStore(reducer, applyMiddleware(createSyncVaultMiddleware()));
 ```
 
-**Limitations:**
-- No automatic mutation queuing
-- No cache integration between React Query and sync vault
-- Manual error handling required
+## Backend contract
 
-#### Zustand Integration
+Exactly-once needs cooperation from the server. The full contract is in [docs/BACKEND_CONTRACT.md](docs/BACKEND_CONTRACT.md); in short:
 
-**Status:** Basic hook - adds sync vault to store state. Manual usage required.
+- **Idempotency:** store the response for each `Idempotency-Key` (scoped per user) and replay it for duplicates. Return `422` if a key is reused with a different payload, and `425` with `Retry-After` while the original request is still processing.
+- **Optimistic concurrency:** return an `ETag` with each resource version, check `If-Match`, and answer a mismatch with `412`, the current body, and its `ETag`.
+- **Retry signalling:** send `Retry-After` with `429` and `503`. Use `4xx` only for requests that will never succeed.
+- **Client IDs:** accept client-generated UUIDv7 primary keys on create.
+- **Batch (optional):** `POST /sync/batch` with ordered operations, each carrying its own `Idempotency-Key`.
 
-**⚠️ Note:** The `withSyncVault` function is broken (violates React hooks rules) and should not be used. Only use `useZustandWithSyncVault`.
+[`server/express-sync-vault`](server/express-sync-vault) is a reference Express implementation (`idempotency`, `ifMatch`, `setETag`, `retryAfter`, `rateLimit`, `batchRouter`, `MemoryStore`, `RedisStore`). It's also the server the test suites run against.
 
-```typescript
-import { create } from 'zustand';
-import { ZustandIntegration } from 'react-native-sync-vault/integrations';
+## Testing
 
-// Create your Zustand store
-const useStore = create((set) => ({
-  todos: [],
-  addTodo: (todo) => set((state) => ({ todos: [...state.todos, todo] }))
-}));
+### Testing your app
 
-function MyComponent() {
-  // Use the integration hook to get store state + syncVault
-  const store = ZustandIntegration.useZustandWithSyncVault(useStore, {
-    baseUrl: 'https://api.example.com'
-  });
+`MemorySyncVault` is a pure-TypeScript engine with the same semantics as the native ones. Swap it in with `setNativeImplementation` to unit-test code that uses Sync Vault in Jest, without a device:
 
-  // Access your store state plus syncVault
-  // You'll need to manually use queue.push() for API calls
-  const handleAddTodo = async (todo) => {
-    store.addTodo(todo);
-    
-    // Manually queue API call
-    await store.syncVault.queue.push({
-      method: 'POST',
-      url: '/api/todos',
-      data: todo
-    });
-  };
+```ts
+import { setNativeImplementation, SyncVault } from 'react-native-sync-vault';
+import { MemorySyncVault } from 'react-native-sync-vault/lib/testing';
 
-  return (
-    <View>
-      {store.todos.map(todo => <Text key={todo.id}>{todo.text}</Text>)}
-      <Button onPress={() => handleAddTodo({ id: 1, text: 'New' })} title="Add" />
-      <Button onPress={() => store.syncVault.sync()} title="Sync" />
-    </View>
-  );
-}
+beforeEach(() => setNativeImplementation(new MemorySyncVault()));
 ```
 
-**Limitations:**
-- No automatic API call queuing from store actions
-- Manual queue management required
-- The `withSyncVault` wrapper function is broken and should not be used
+### How the library is verified
 
-#### Redux Integration
+| Suite | What it covers |
+| --- | --- |
+| Contract (`src/testing/contract.ts`) | Enqueue, delivery, ordering, retries, connectivity, auth, conflicts, coalescing, durability, management, cache. One suite that any engine must pass. |
+| Native contract (example app) | The same guarantees run through the real Turbo Module over real HTTP on a simulator/emulator, against the reference server. Android and iOS must report identical results. |
+| Chaos | Kills the engine mid-request and injects 5xx, 429, and dropped responses; asserts every effect is applied exactly once. |
+| State-machine property tests | Thousands of seeded random operation sequences checked against the outbox invariants (`SYNC_VAULT_SEEDS`, `SYNC_VAULT_SEED`, `SYNC_VAULT_TRACE`). |
+| Migration | The v1-to-v2 import SQL against real SQLite (`node:sqlite`, Node 22.13+). |
+| Retry policy | The shared classification and backoff table. |
 
-**Status:** Functional - Basic middleware for queuing actions with API metadata.
+To run the native contract on a device or simulator, start the reference server and Metro, then launch the example app in contract mode. Results show on the Contract tab and are posted to the server:
 
-This is the most functional integration. It automatically queues Redux actions that include API call metadata:
+```bash
+cd examples/todo-app
+npm run server        # reference server with the test control API on :4000
+npm start             # Metro
 
-```typescript
-import { createStore, applyMiddleware } from 'redux';
-import { ReduxIntegration } from 'react-native-sync-vault/integrations';
+# iOS (simulator)
+xcrun simctl launch booted org.reactjs.native.example.SyncVaultTodo -SyncVaultContract autorun
+# Android (emulator)
+adb shell am start -a android.intent.action.VIEW -d "syncvaulttodo://contract" com.syncvaulttodo
 
-const middleware = [
-  ReduxIntegration.createSyncVaultMiddleware({ 
-    baseUrl: 'https://api.example.com' 
-  })
-];
-
-const store = createStore(reducer, applyMiddleware(...middleware));
-
-// Actions with API call metadata will be queued when offline:
-dispatch({
-  type: 'CREATE_TODO',
-  payload: { text: 'New todo' },
-  meta: {
-    apiCall: {
-      method: 'POST',
-      url: '/api/todos',
-      data: { text: 'New todo' }
-    },
-    queueIfOffline: true
-  }
-});
+curl localhost:4000/__control/report   # { platform, passed, total, results }
 ```
 
-**What it does:**
-- Automatically queues actions with `meta.apiCall` and `meta.queueIfOffline: true`
-- Works when device is offline
+## Migrating from v1
 
-**Limitations:**
-- Basic implementation - no automatic sync retry integration
-- No automatic success/failure action dispatching
-- Requires manual action metadata structure
+- **Breaking:** React Native 0.76+ with the New Architecture is required, and the legacy bridge module is gone.
+- **Breaking:** the engine is a singleton configured with `SyncVault.configure()` at app start instead of the `useOfflineQueue()` hook owning it.
+- **Automatic:** queued v1 requests are imported into the v2 outbox on first launch ([`schema/sync_vault/import_v1.sql`](schema/sync_vault/import_v1.sql)).
+- **Compatibility:** the default export `OfflineQueue` (`initialize`, `push`, `getPendingRequests`, …) and `useOfflineQueue()` still work and map onto `SyncVault`. They're deprecated.
 
-## API Reference
+| v1 | v2 |
+| --- | --- |
+| `OfflineQueue.initialize(config)` | `SyncVault.configure(config)` |
+| `queue.push({ data, maxRetries })` | `SyncVault.enqueue({ body, maxAttempts })` (`maxAttempts = maxRetries + 1`) |
+| `queue.sync()` / `triggerSync()` | `SyncVault.drainNow()` |
+| `getFailedRequests()` | `SyncVault.getDeadLetters()` / `useFailedRequests()` |
+| `conflictResolution: 'custom'` + `customResolver` | `conflictStrategy: 'merge'` + `merge`, or a global `conflictResolver` |
+| Static auth headers in each request | `getAuthHeaders` provider |
 
-See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for complete API documentation.
+See [docs/MIGRATION.md](docs/MIGRATION.md) for details.
 
-### Main Hooks
+## Example app
 
-**Queue Management:**
-- `useOfflineQueue(config?)` - Main hook for queue management
-- `useQueueStatus()` - Monitor queue status (event-based reactive updates)
-- `usePendingRequests(limit?)` - Get pending requests (event-based reactive updates)
-- `useFailedRequests()` - Get failed requests with retry (event-based reactive updates)
+[`examples/todo-app`](examples/todo-app) is a React Native 0.76 New Architecture app with two tabs:
 
-**Caching:**
-- `useCache(cacheManager?)` - Access cache operations
-- `useSmartCache(config?)` - Smart cache with invalidation
+- **Todos:** an offline-first todo list with optimistic updates, per-todo ordering, coalesced toggles, and live sync status.
+- **Contract:** runs the native contract scenarios against the reference server.
 
-**Offline-Ready:**
-- `useOfflineQuery(key, options?)` - React Query-like query hook
-- `useOfflineMutation(options?)` - React Query-like mutation hook
+```bash
+cd examples/todo-app
+npm install && npm run pods
+npm run server
+npm run ios    # or: npm run android
+```
 
-**Resource & Background:**
-- `useResourceAwareSync(config?)` - Resource-aware sync configuration
-- `useBackgroundSync()` - Background sync guarantees
+## Development
 
-**Metrics:**
-- `useSyncMetrics()` - Sync performance metrics
+```bash
+npm test               # Jest: contract, chaos, property, migration, unit tests
+npm run lint
+npm run type-check
+npm run codegen:check  # the Turbo Module spec matches the Kotlin and Objective-C++ implementations
+npm run build
+```
 
-### Queue Methods
+The Kotlin, Swift, and TypeScript engines share the schema in [`schema/sync_vault`](schema/sync_vault) and the retry table; changes to one must be mirrored in the others, and the contract suite is the arbiter.
 
-- `queue.push(options)` - Queue a request
-- `queue.getPendingRequests(limit?, offset?)` - Get pending requests
-- `queue.getFailedRequests()` - Get failed requests
-- `queue.sync()` - Manually trigger sync
-- `queue.getCacheManager()` - Get cache manager instance
+## What it isn't
 
-### UI Components
-
-- `OfflineProvider` - Context provider for offline state
-- `OfflineStatusBar` - Connection status indicator
-- `QueuedActionsBadge` - Pending actions counter
-- `SyncProgress` - Sync progress indicator
-
-### Debug Tools
-
-- `DebugScreen` - Built-in debug screen
-- `QueueLogger` - Queue logging utility
-- `SyncDashboard` - Sync metrics dashboard
-
-### Integrations
-
-**⚠️ Note:** All integrations are basic adapters with limited functionality. They require manual integration work for production use.
-
-- `ReactQueryIntegration.useReactQueryWithSyncVault(config)` - Returns `{ queryClient, queue }` (manual integration required)
-- `ZustandIntegration.useZustandWithSyncVault(store, config)` - Adds sync vault to Zustand store state (manual usage required)
-- `ReduxIntegration.createSyncVaultMiddleware(config)` - Middleware for queuing Redux actions (functional, basic implementation)
-- `ReduxIntegration.withSyncVault(reducer, config)` - Helper to set up Redux with sync vault middleware
-
-**Note:** `ZustandIntegration.withSyncVault` is broken and should not be used. `ReactQueryIntegration.withSyncVault` is non-functional (only stores config).
-
-## Examples
-
-Check out the [examples directory](examples/) for complete example applications:
-
-- **Todo App** - Complete offline-first todo management with automatic interception, caching, and error handling
-
-## Performance
-
-- **Initialization**: < 50ms
-- **Enqueue time**: < 5ms
-- **Memory overhead**: < 1KB per request
-- **Batch sync**: < 100ms per batch of 5 requests
-- **Cache lookup**: < 2ms
-- **Cache hit rate**: 60-80% in typical usage
-
-See [Performance Benchmarks](docs/PERFORMANCE_BENCHMARKS.md) for detailed metrics and comparisons.
+- Not a local database or ORM (see WatermelonDB or op-sqlite). Sync Vault queues *writes to your server*; your app keeps its own local state.
+- Not a two-way sync engine. It delivers outgoing mutations reliably; pulling changes down (for example delta sync) is up to your app. See the backend contract for a recommended approach.
+- Not a general-purpose query cache, although it includes a small native response cache for offline reads.
 
 ## Contributing
 

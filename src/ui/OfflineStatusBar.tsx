@@ -1,46 +1,28 @@
 import React from 'react';
-import { View, Text, StyleSheet, ViewStyle, TextStyle } from 'react-native';
+import { StyleSheet, Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
 import { useOfflineContext } from './OfflineProvider';
 
-/**
- * Offline Status Bar Props
- */
 interface OfflineStatusBarProps {
   position?: 'top' | 'bottom';
-  style?: ViewStyle;
-  textStyle?: TextStyle;
+  style?: StyleProp<ViewStyle>;
+  textStyle?: StyleProp<TextStyle>;
   showQueueCount?: boolean;
 }
 
-/**
- * Offline Status Bar
- * Shows connection status and queued actions count
- */
-export function OfflineStatusBar({
-  position = 'top',
-  style,
-  textStyle,
-  showQueueCount = true,
-}: OfflineStatusBarProps) {
-  const { isOnline, queueSize } = useOfflineContext();
+/** Connection status plus queued and failed counts. Hidden when online with nothing queued. */
+export function OfflineStatusBar({ position = 'top', style, textStyle, showQueueCount = true }: OfflineStatusBarProps) {
+  const { isOnline, pendingCount, counts } = useOfflineContext();
 
-  if (isOnline && queueSize === 0) {
-    return null; // Don't show when online and nothing queued
-  }
+  if (isOnline && pendingCount === 0 && counts.deadLetter === 0) return null;
 
-  const containerStyle = [
-    styles.container,
-    position === 'top' ? styles.top : styles.bottom,
-    style,
-  ] as ViewStyle;
+  const parts = [isOnline ? 'Online' : 'Offline'];
+  if (showQueueCount && pendingCount > 0) parts.push(`${pendingCount} queued`);
+  if (showQueueCount && counts.deadLetter > 0) parts.push(`${counts.deadLetter} failed`);
 
   return (
-    <View style={containerStyle}>
+    <View style={[styles.container, position === 'top' ? styles.top : styles.bottom, style]} accessibilityRole="summary">
       <View style={[styles.indicator, isOnline ? styles.online : styles.offline]} />
-      <Text style={[styles.text, textStyle]}>
-        {isOnline ? 'Online' : 'Offline'}
-        {showQueueCount && queueSize > 0 && ` • ${queueSize} queued`}
-      </Text>
+      <Text style={[styles.text, textStyle]}>{parts.join(' • ')}</Text>
     </View>
   );
 }
@@ -52,16 +34,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 8,
     backgroundColor: '#f0f0f0',
-    borderBottomWidth: 1,
-    borderBottomColor: '#ddd',
   },
   top: {
     borderBottomWidth: 1,
-    borderTopWidth: 0,
+    borderBottomColor: '#ddd',
   },
   bottom: {
     borderTopWidth: 1,
-    borderBottomWidth: 0,
     borderTopColor: '#ddd',
   },
   indicator: {
@@ -81,4 +60,3 @@ const styles = StyleSheet.create({
     color: '#333',
   },
 });
-

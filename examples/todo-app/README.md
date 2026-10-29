@@ -1,87 +1,79 @@
-# Todo App Example
+This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
-A simple todo application demonstrating offline-first functionality with react-native-sync-vault.
+# Getting Started
 
-## Features
+>**Note**: Make sure you have completed the [React Native - Environment Setup](https://reactnative.dev/docs/environment-setup) instructions till "Creating a new application" step, before proceeding.
 
-- ✅ Create todos offline
-- ✅ Update todos offline
-- ✅ Delete todos offline
-- ✅ Automatic sync when online
-- ✅ Queue status monitoring
-- ✅ Failed request handling
+## Step 1: Start the Metro Server
 
-## Setup
+First, you will need to start **Metro**, the JavaScript _bundler_ that ships _with_ React Native.
+
+To start Metro, run the following command from the _root_ of your React Native project:
 
 ```bash
-cd examples/todo-app
-npm install
-cd ios && pod install && cd ..
+# using npm
+npm start
+
+# OR using Yarn
+yarn start
 ```
 
-## Run
+## Step 2: Start your Application
+
+Let Metro Bundler run in its _own_ terminal. Open a _new_ terminal from the _root_ of your React Native project. Run the following command to start your _Android_ or _iOS_ app:
+
+### For Android
 
 ```bash
-# iOS
-npx react-native run-ios
+# using npm
+npm run android
 
-# Android
-npx react-native run-android
+# OR using Yarn
+yarn android
 ```
 
-## What It Demonstrates
+### For iOS
 
-1. **Basic Queue Usage**: Queue POST, PUT, DELETE requests
-2. **Automatic Interception**: Uses fetch() interception for seamless offline support
-3. **Status Monitoring**: Shows queue status in real-time
-4. **Error Handling**: Displays and retries failed requests
-5. **Priority Queuing**: Uses priorities for important operations
+```bash
+# using npm
+npm run ios
 
-## Code Structure
-
-```
-todo-app/
-├── src/
-│   ├── components/
-│   │   ├── TodoList.tsx      # Main todo list component
-│   │   ├── TodoItem.tsx     # Individual todo item
-│   │   └── QueueStatus.tsx  # Queue status display
-│   ├── hooks/
-│   │   └── useTodos.ts      # Custom hook for todos
-│   └── App.tsx              # Main app component
-└── README.md
+# OR using Yarn
+yarn ios
 ```
 
-## Key Code Snippets
+If everything is set up _correctly_, you should see your new app running in your _Android Emulator_ or _iOS Simulator_ shortly provided you have set up your emulator/simulator correctly.
 
-### Queueing a Request
+This is one way to run your app — you can also run it directly from within Android Studio and Xcode respectively.
 
-```typescript
-const queue = useOfflineQueue({
-  baseUrl: 'https://api.example.com',
-  interceptor: { enabled: true },
-});
+## Step 3: Modifying your App
 
-// Just use fetch() - automatically queued if offline
-await fetch('https://api.example.com/todos', {
-  method: 'POST',
-  body: JSON.stringify({ text: 'New todo' }),
-});
-```
+Now that you have successfully run the app, let's modify it.
 
-### Monitoring Status
+1. Open `App.tsx` in your text editor of choice and edit some lines.
+2. For **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Developer Menu** (<kbd>Ctrl</kbd> + <kbd>M</kbd> (on Window and Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (on macOS)) to see your changes!
 
-```typescript
-const { status } = useQueueStatus();
+   For **iOS**: Hit <kbd>Cmd ⌘</kbd> + <kbd>R</kbd> in your iOS Simulator to reload the app and see your changes!
 
-console.log('Network:', status?.networkStatus);
-console.log('Pending:', status?.totalPending);
-console.log('Failed:', status?.totalFailed);
-```
+## Congratulations! :tada:
 
-## Learn More
+You've successfully run and modified your React Native App. :partying_face:
 
-- [API Reference](../../docs/API_REFERENCE.md)
-- [Migration Guide](../../docs/MIGRATION.md)
-- [Main README](../../README.md)
+### Now what?
 
+- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
+- If you're curious to learn more about React Native, check out the [Introduction to React Native](https://reactnative.dev/docs/getting-started).
+
+# Troubleshooting
+
+If you can't get this to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
+
+# Learn More
+
+To learn more about React Native, take a look at the following resources:
+
+- [React Native Website](https://reactnative.dev) - learn more about React Native.
+- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
+- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
+- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
+- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.

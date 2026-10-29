@@ -1,46 +1,55 @@
-import { OfflineQueueConfig } from '../types';
-import { useOfflineQueue } from '../hooks/useOfflineQueue';
+import { SyncVault } from '../core/SyncVault';
+import type { EnqueueOptions, SyncEvent } from '../core/types';
 
-/**
- * React Query Integration
- * Wraps QueryClient with sync vault for offline support
- * 
- * Note: Requires @tanstack/react-query to be installed
- */
-export function withSyncVault(
-  queryClient: any, // QueryClient from @tanstack/react-query
-  config: OfflineQueueConfig
-): any {
-  // Initialize offline queue
-  // Note: This is a simplified integration
-  // In a full implementation, you would:
-  // 1. Intercept query mutations to queue them
-  // 2. Use sync vault cache for query data
-  // 3. Sync mutations when online
+type QueryKey = readonly unknown[];
+type QueryClientLike = { invalidateQueries: (filters: { queryKey: QueryKey }) => unknown };
 
-  // Store config for later use
-  (queryClient as any).__syncVaultConfig = config;
-
-  return queryClient;
+export interface QueuedMutationResult {
+  queued: true;
+  requestId: string;
 }
 
 /**
- * Hook to use React Query with sync vault
+ * Builds a TanStack Query `mutationFn` that durably queues the request instead of sending it.
+ *
+ *   useMutation({ mutationFn: syncVaultMutationFn((todo) => ({ method: 'POST', url: '/todos', body: todo })) })
  */
-export function useReactQueryWithSyncVault(config: OfflineQueueConfig) {
-  const queue = useOfflineQueue(config);
-
-  // Dynamically import QueryClient if available
-  let QueryClient: any = null;
-  try {
-    QueryClient = require('@tanstack/react-query').QueryClient;
-  } catch (error) {
-    // React Query not installed
-  }
-
-  return {
-    queryClient: QueryClient ? new QueryClient() : null,
-    queue,
+export function syncVaultMutationFn<TVariables>(toRequest: (variables: TVariables) => EnqueueOptions) {
+  return async (variables: TVariables): Promise<QueuedMutationResult> => {
+    const requestId = await SyncVault.enqueue(toRequest(variables));
+    return { queued: true, requestId };
   };
 }
 
+/**
+ * Invalidates queries when queued requests are delivered. `queryKeysFor` receives the delivered
+ * request's method and URL and returns the query keys it affects.
+ */
+export function withSyncVault<T extends QueryClientLike>(
+  queryClient: T,
+  queryKeysFor: (request: { method: string; url: string }) => QueryKey[]
+): () => void {
+  const pending = new Map<string, { method: string; url: string }>();
+  return SyncVault.addEventListener(async (event: SyncEvent) => {
+    if (!event.id) return;
+    if (event.type === 'enqueued' || event.type === 'coalesced' || event.type === 'attempt') {
+      if (!pending.has(event.id)) {
+        const request = await SyncVault.getRequest(event.id);
+        if (request) pending.set(event.id, { method: request.method, url: request.url });
+      }
+      return;
+    }
+    if (event.type === 'succeeded' || event.type === 'discarded' || event.type === 'dead_lettered') {
+      let request = pending.get(event.id);
+      pending.delete(event.id);
+      if (event.type === 'succeeded' && !request) {
+        // Delivered before the lookup above finished; succeeded rows stay readable until purged.
+        const row = await SyncVault.getRequest(event.id);
+        if (row) request = { method: row.method, url: row.url };
+      }
+      if (event.type === 'succeeded' && request) {
+        for (const queryKey of queryKeysFor(request)) queryClient.invalidateQueries({ queryKey });
+      }
+    }
+  });
+}

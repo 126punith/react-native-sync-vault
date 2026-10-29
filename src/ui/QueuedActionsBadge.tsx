@@ -1,37 +1,24 @@
 import React from 'react';
-import { View, Text, StyleSheet, ViewStyle, TextStyle } from 'react-native';
+import { StyleSheet, Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
 import { useOfflineContext } from './OfflineProvider';
 
-/**
- * Queued Actions Badge Props
- */
 interface QueuedActionsBadgeProps {
-  style?: ViewStyle;
-  textStyle?: TextStyle;
-  badgeStyle?: ViewStyle;
+  style?: StyleProp<ViewStyle>;
+  textStyle?: StyleProp<TextStyle>;
+  badgeStyle?: StyleProp<ViewStyle>;
   showWhenZero?: boolean;
 }
 
-/**
- * Queued Actions Badge
- * Shows count of pending queued actions
- */
-export function QueuedActionsBadge({
-  style,
-  textStyle,
-  badgeStyle,
-  showWhenZero = false,
-}: QueuedActionsBadgeProps) {
-  const { queueSize } = useOfflineContext();
+/** Count of requests waiting for delivery. */
+export function QueuedActionsBadge({ style, textStyle, badgeStyle, showWhenZero = false }: QueuedActionsBadgeProps) {
+  const { pendingCount } = useOfflineContext();
 
-  if (queueSize === 0 && !showWhenZero) {
-    return null;
-  }
+  if (pendingCount === 0 && !showWhenZero) return null;
 
   return (
     <View style={[styles.container, style]}>
       <View style={[styles.badge, badgeStyle]}>
-        <Text style={[styles.text, textStyle]}>{queueSize}</Text>
+        <Text style={[styles.text, textStyle]}>{pendingCount}</Text>
       </View>
       <Text style={[styles.label, textStyle]}>pending</Text>
     </View>
@@ -63,4 +50,3 @@ const styles = StyleSheet.create({
     color: '#666',
   },
 });
-

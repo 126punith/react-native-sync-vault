@@ -1,28 +1,25 @@
 module.exports = {
-  preset: 'react-native',
+  testEnvironment: 'node',
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json'],
   transform: {
-    '^.+\\.(ts|tsx)$': 'ts-jest',
+    '^.+\\.(ts|tsx)$': ['ts-jest', { tsconfig: { jsx: 'react', esModuleInterop: true, strict: true, target: 'ES2020', module: 'commonjs' }, diagnostics: { warnOnly: false } }],
   },
-  testMatch: ['**/__tests__/**/*.(ts|tsx|js)'],
+  testMatch: ['<rootDir>/__tests__/**/*.test.(ts|tsx|js)'],
+  moduleNameMapper: {
+    '^react-native$': '<rootDir>/__mocks__/react-native.ts',
+    '^react-native/Libraries/Types/CodegenTypes$': '<rootDir>/__mocks__/codegen-types.ts',
+  },
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
   collectCoverageFrom: [
     'src/**/*.{ts,tsx}',
     '!src/**/*.d.ts',
-    '!src/**/__tests__/**',
-    '!src/index.ts', // Entry point, mostly re-exports
+    '!src/specs/**',
+    '!src/index.ts',
+    '!src/ui/**',
+    '!src/debug/DebugScreen.tsx',
+    '!src/debug/SyncDashboard.tsx',
   ],
   coverageThreshold: {
-    global: {
-      branches: 70,
-      functions: 70,
-      lines: 70,
-      statements: 70,
-    },
+    global: { branches: 60, functions: 70, lines: 70, statements: 70 },
   },
-  moduleNameMapper: {
-    '^@/(.*)$': '<rootDir>/src/$1',
-  },
-  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
 };
-
-

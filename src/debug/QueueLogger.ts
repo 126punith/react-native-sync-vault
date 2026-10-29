@@ -1,126 +1,63 @@
-/**
- * Structured logging for queue operations
- */
+import { SyncVault } from '../core/SyncVault';
+import type { SyncEvent } from '../core/types';
+
+export interface LogEntry {
+  timestamp: number;
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  event?: SyncEvent;
+}
+
+const LEVELS: Partial<Record<SyncEvent['type'], LogEntry['level']>> = {
+  retry_scheduled: 'warn',
+  auth_blocked: 'warn',
+  conflict: 'warn',
+  dead_lettered: 'error',
+};
+
+/** Ring buffer of engine events for debug screens and bug reports. Off until start(). */
 class QueueLoggerClass {
-  private enabled: boolean = __DEV__;
-  private logs: Array<{
-    timestamp: number;
-    level: 'info' | 'warn' | 'error' | 'debug';
-    message: string;
-    data?: any;
-  }> = [];
-  private maxLogs: number = 1000;
+  private logs: LogEntry[] = [];
+  private maxLogs = 500;
+  private unsubscribe: (() => void) | null = null;
 
-  /**
-   * Enable or disable logging
-   */
-  setEnabled(enabled: boolean): void {
-    this.enabled = enabled;
+  start(maxLogs = 500): void {
+    this.maxLogs = maxLogs;
+    if (this.unsubscribe) return;
+    this.unsubscribe = SyncVault.addEventListener((event) => this.append(event));
   }
 
-  /**
-   * Log info message
-   */
-  info(message: string, data?: any): void {
-    this.log('info', message, data);
+  stop(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
   }
 
-  /**
-   * Log warning message
-   */
-  warn(message: string, data?: any): void {
-    this.log('warn', message, data);
+  isRunning(): boolean {
+    return this.unsubscribe != null;
   }
 
-  /**
-   * Log error message
-   */
-  error(message: string, data?: any): void {
-    this.log('error', message, data);
+  private append(event: SyncEvent): void {
+    const details = [event.id, event.httpStatus ? `HTTP ${event.httpStatus}` : null, event.error].filter(Boolean).join(' ');
+    this.logs.push({
+      timestamp: event.timestamp,
+      level: LEVELS[event.type] ?? 'info',
+      message: details ? `${event.type} ${details}` : event.type,
+      event,
+    });
+    if (this.logs.length > this.maxLogs) this.logs.splice(0, this.logs.length - this.maxLogs);
   }
 
-  /**
-   * Log debug message
-   */
-  debug(message: string, data?: any): void {
-    this.log('debug', message, data);
-  }
-
-  /**
-   * Internal log method
-   */
-  private log(level: 'info' | 'warn' | 'error' | 'debug', message: string, data?: any): void {
-    const logEntry = {
-      timestamp: Date.now(),
-      level,
-      message,
-      data,
-    };
-
-    this.logs.push(logEntry);
-
-    // Keep only last maxLogs entries
-    if (this.logs.length > this.maxLogs) {
-      this.logs.shift();
-    }
-
-    if (this.enabled) {
-      const prefix = `[OfflineQueue:${level.toUpperCase()}]`;
-      switch (level) {
-        case 'info':
-          console.log(prefix, message, data || '');
-          break;
-        case 'warn':
-          console.warn(prefix, message, data || '');
-          break;
-        case 'error':
-          console.error(prefix, message, data || '');
-          break;
-        case 'debug':
-          console.debug(prefix, message, data || '');
-          break;
-      }
-    }
-  }
-
-  /**
-   * Get all logs
-   */
-  getLogs(): Array<{
-    timestamp: number;
-    level: 'info' | 'warn' | 'error' | 'debug';
-    message: string;
-    data?: any;
-  }> {
+  getLogs(): LogEntry[] {
     return [...this.logs];
   }
 
-  /**
-   * Get logs filtered by level
-   */
-  getLogsByLevel(level: 'info' | 'warn' | 'error' | 'debug'): Array<{
-    timestamp: number;
-    level: 'info' | 'warn' | 'error' | 'debug';
-    message: string;
-    data?: any;
-  }> {
-    return this.logs.filter((log) => log.level === level);
-  }
-
-  /**
-   * Clear all logs
-   */
   clear(): void {
     this.logs = [];
   }
 
-  /**
-   * Export logs as JSON
-   */
-  exportLogs(): string {
-    return JSON.stringify(this.logs, null, 2);
+  export(): string {
+    return this.logs.map((l) => `${new Date(l.timestamp).toISOString()} [${l.level}] ${l.message}`).join('\n');
   }
 }
 
 export const QueueLogger = new QueueLoggerClass();
-

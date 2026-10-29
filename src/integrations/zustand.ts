@@ -1,63 +1,26 @@
-import { OfflineQueueConfig } from '../types';
-import { useOfflineQueue } from '../hooks/useOfflineQueue';
+import { SyncVault } from '../core/SyncVault';
+import type { EnqueueOptions, QueueCounts } from '../core/types';
 
-// Types for Zustand (optional dependency)
-type StoreApi<T> = any;
-type UseBoundStore<T> = any;
-
-/**
- * Zustand Integration
- * Wraps Zustand store with sync vault for offline support
- */
-export function withSyncVault<T extends object>(
-  storeCreator: (set: any, get: any) => T,
-  config: OfflineQueueConfig
-): (set: any, get: any) => T {
-  // Initialize offline queue
-  const queue = useOfflineQueue(config);
-
-  // Wrap store creator to add sync vault functionality
-  return (set: any, get: any) => {
-    const store = storeCreator(set, get);
-
-    // Add sync vault methods to store
-    return {
-      ...store,
-      __syncVault: {
-        queue,
-        sync: async () => {
-          // Trigger sync
-          await queue.sync();
-        },
-        getPendingCount: async () => {
-          const pending = await queue.getPendingRequests(1000, 0);
-          return pending.length;
-        },
-      },
-    };
+export interface SyncVaultSlice {
+  syncVault: {
+    enqueue: (options: EnqueueOptions) => Promise<string>;
+    drainNow: () => void;
+    getCounts: () => Promise<QueueCounts>;
   };
 }
 
 /**
- * Hook to use Zustand with sync vault
+ * Adds a `syncVault` slice to a Zustand store creator so actions can queue requests:
+ *
+ *   create(withSyncVault((set, get) => ({ addTodo: async (t) => { set(...); await get().syncVault.enqueue({...}) } })))
  */
-export function useZustandWithSyncVault<T extends object>(
-  store: UseBoundStore<StoreApi<T>>,
-  config: OfflineQueueConfig
-) {
-  const queue = useOfflineQueue(config);
-  const storeState = store();
-
-  return {
-    ...storeState,
+export function withSyncVault<T extends object, S = unknown, G = unknown>(storeCreator: (set: S, get: G) => T) {
+  return (set: S, get: G): T & SyncVaultSlice => ({
+    ...storeCreator(set, get),
     syncVault: {
-      queue,
-      sync: queue.sync,
-      getPendingCount: async () => {
-        const pending = await queue.getPendingRequests(1000, 0);
-        return pending.length;
-      },
+      enqueue: (options) => SyncVault.enqueue(options),
+      drainNow: () => SyncVault.drainNow(),
+      getCounts: () => SyncVault.getCounts(),
     },
-  };
+  });
 }
-

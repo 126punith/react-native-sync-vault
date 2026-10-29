@@ -1,426 +1,221 @@
-import { CacheEntry, CacheConfig, CacheResult } from '../types';
-import { generateRequestId } from '../utils/idGenerator';
-import { getNativeModule } from '../utils/nativeModule';
+import { SyncVault } from '../core/SyncVault';
+import type { CacheConfig, CacheResult, CacheStrategy, EndpointCacheStrategy } from '../types';
 
-// Get native module
-const NativeModule = getNativeModule();
+interface StoredValue<T> {
+  data: T;
+  /** Fresh until this time; afterwards stale (still served with stale-while-revalidate). */
+  freshUntil: number;
+}
+
+export interface CacheSetOptions {
+  /** TTL in seconds. */
+  ttl?: number;
+  tags?: string[];
+  /** Endpoint pattern used to look up a per-endpoint strategy. */
+  endpoint?: string;
+}
+
+export interface FetchOptions extends CacheSetOptions {
+  strategy?: CacheStrategy;
+}
+
+export interface FetchResult<T> {
+  data: T;
+  fromCache: boolean;
+  stale: boolean;
+}
+
+const DEFAULT_TTL_SECONDS = 3600;
+const DEFAULT_MAX_SIZE = 50 * 1024 * 1024;
+
+/** Converts '/api/todos/*' or '/api/todos/:id' patterns to a RegExp. */
+export function patternToRegExp(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '\uE000')
+    .replace(/\*/g, '[^/?]*')
+    .replace(/\uE000/g, '.*')
+    .replace(/:[A-Za-z_][A-Za-z0-9_]*/g, '[^/?]+');
+  return new RegExp(`^${escaped}(\\?.*)?$`);
+}
+
+/** The path of a URL without origin and query, used as a cache tag for exact invalidation. */
+export function pathTag(url: string): string {
+  const withoutOrigin = url.replace(/^[a-z]+:\/\/[^/]+/i, '');
+  const path = withoutOrigin.split('?')[0] ?? withoutOrigin;
+  return `path:${path || '/'}`;
+}
 
 /**
- * Cache Manager - Handles response caching with SQLite storage
+ * Response cache on top of the native SQLite cache (`SyncVault.cache`): TTLs, tags,
+ * cache-first / network-first / stale-while-revalidate, mutation-driven invalidation,
+ * and LRU size limits enforced natively.
  */
 class CacheManager {
   private config: CacheConfig;
-  private isInitialized: boolean = false;
-  private cacheTableName: string = 'response_cache';
 
   constructor(config: CacheConfig = {}) {
-    this.config = {
-      enabled: config.enabled ?? true,
-      defaultTtl: config.defaultTtl ?? 3600, // 1 hour default
-      maxSize: config.maxSize ?? 50 * 1024 * 1024, // 50MB default
-      strategy: config.strategy ?? 'network-first',
-      invalidateOnError: config.invalidateOnError ?? false,
-    };
+    this.config = { enabled: true, ...config };
   }
 
-  /**
-   * Initialize cache manager and create cache table
-   */
-  async initialize(): Promise<void> {
-    if (this.isInitialized) {
-      return;
-    }
-
-    if (!NativeModule) {
-      if (__DEV__) {
-        console.warn('Native module not available. Cache will not work.');
-      }
-      return;
-    }
-
-    try {
-      // Create cache table if it doesn't exist
-      await this.createCacheTable();
-      this.isInitialized = true;
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Failed to initialize cache:', error);
-      }
-      throw error;
-    }
+  isEnabled(): boolean {
+    return this.config.enabled !== false;
   }
 
-  /**
-   * Create cache table in SQLite
-   */
-  private async createCacheTable(): Promise<void> {
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS ${this.cacheTableName} (
-        id TEXT PRIMARY KEY,
-        key TEXT NOT NULL UNIQUE,
-        value TEXT NOT NULL,
-        ttl INTEGER NOT NULL,
-        tags TEXT,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        last_accessed_at INTEGER NOT NULL,
-        size INTEGER NOT NULL
-      )
-    `;
+  configure(config: CacheConfig): void {
+    this.config = { ...this.config, ...config };
+  }
 
-    const createIndexes = [
-      `CREATE INDEX IF NOT EXISTS idx_cache_key ON ${this.cacheTableName}(key)`,
-      `CREATE INDEX IF NOT EXISTS idx_cache_ttl ON ${this.cacheTableName}(ttl)`,
-      `CREATE INDEX IF NOT EXISTS idx_cache_tags ON ${this.cacheTableName}(tags)`,
-      `CREATE INDEX IF NOT EXISTS idx_cache_last_accessed ON ${this.cacheTableName}(last_accessed_at)`,
-    ];
-
-    try {
-      await NativeModule.executeSql(createTableQuery, []);
-      for (const indexQuery of createIndexes) {
-        await NativeModule.executeSql(indexQuery, []);
-      }
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Failed to create cache table:', error);
-      }
-      throw error;
+  getEndpointStrategy(endpoint: string): EndpointCacheStrategy | undefined {
+    const strategies = this.config.strategies ?? {};
+    if (strategies[endpoint]) return strategies[endpoint];
+    for (const [pattern, strategy] of Object.entries(strategies)) {
+      if (patternToRegExp(pattern).test(endpoint)) return strategy;
     }
+    return undefined;
   }
 
-  /**
-   * Generate cache key from URL and method
-   */
-  private generateCacheKey(url: string, method: string = 'GET'): string {
-    // Normalize URL (remove query params for GET requests if needed)
-    const normalizedUrl = method === 'GET' ? url.split('?')[0] : url;
-    return `${method}:${normalizedUrl}`;
+  private ttlSeconds(key: string, options: CacheSetOptions = {}): number {
+    return options.ttl ?? this.getEndpointStrategy(options.endpoint ?? key)?.ttl ?? this.config.defaultTtl ?? DEFAULT_TTL_SECONDS;
   }
 
-  /**
-   * Get cache entry by key
-   */
-  async get(key: string): Promise<CacheResult> {
-    if (!this.config.enabled || !this.isInitialized) {
+  private usesSwr(key: string, endpoint?: string): boolean {
+    const strategy = this.getEndpointStrategy(endpoint ?? key);
+    return strategy?.staleWhileRevalidate === true || (strategy?.strategy ?? this.config.strategy) === 'stale-while-revalidate';
+  }
+
+  async get<T = unknown>(key: string, endpoint?: string): Promise<CacheResult<T>> {
+    if (!this.isEnabled()) return { hit: false };
+    const entry = await SyncVault.cache.get<StoredValue<T>>(key);
+    if (!entry || entry.value == null || typeof entry.value !== 'object') return { hit: false };
+    const now = Date.now();
+    const stale = now > entry.value.freshUntil;
+    if (stale && !this.usesSwr(key, endpoint)) {
+      await SyncVault.cache.delete(key);
       return { hit: false };
     }
+    return { hit: true, data: entry.value.data, stale, ttl: Math.max(entry.value.freshUntil - now, 0) };
+  }
 
-    try {
-      const cacheKey = key.includes(':') ? key : this.generateCacheKey(key);
-      const now = Date.now();
-
-      const query = `
-        SELECT * FROM ${this.cacheTableName}
-        WHERE key = ?
-      `;
-
-      const results = await NativeModule.executeSql(query, [cacheKey]);
-
-      if (!results || results.length === 0) {
-        return { hit: false };
-      }
-
-      const entry: CacheEntry = this.parseCacheEntry(results[0]);
-      
-      // Check if expired
-      if (entry.ttl < now) {
-        // Expired - delete and return miss
-        await this.delete(cacheKey);
-        return { hit: false };
-      }
-
-      // Update last accessed time
-      await this.updateLastAccessed(cacheKey, now);
-
-      // Parse cached value
-      const data = JSON.parse(entry.value);
-      const remainingTtl = entry.ttl - now;
-
-      return {
-        hit: true,
-        data,
-        stale: false,
-        ttl: remainingTtl,
-      };
-      } catch (error) {
-        if (__DEV__) {
-          console.error('Cache get error:', error);
-        }
-        return { hit: false };
-    }
+  async set<T>(key: string, data: T, options: CacheSetOptions = {}): Promise<void> {
+    if (!this.isEnabled()) return;
+    const ttlMs = this.ttlSeconds(key, options) * 1000;
+    const swr = this.usesSwr(key, options.endpoint);
+    const stored: StoredValue<T> = { data, freshUntil: Date.now() + ttlMs };
+    // Stale-while-revalidate entries outlive their TTL; the native LRU limit bounds them.
+    await SyncVault.cache.set(key, stored, { ttlMs: swr ? 0 : ttlMs, tags: [...(options.tags ?? []), pathTag(key)] });
+    await this.enforceMaxSize();
   }
 
   /**
-   * Set cache entry
+   * Resolves data with the configured strategy. Network errors fall back to any cached copy
+   * (including stale) so screens keep working offline.
    */
-  async set(
-    key: string,
-    value: any,
-    options?: {
-      ttl?: number;
-      tags?: string[];
-    }
-  ): Promise<void> {
-    if (!this.config.enabled || !this.isInitialized) {
-      return;
-    }
-
-    try {
-      const cacheKey = key.includes(':') ? key : this.generateCacheKey(key);
-      const now = Date.now();
-      const ttl = (options?.ttl ?? this.config.defaultTtl!) * 1000 + now;
-      const valueString = JSON.stringify(value);
-      // Calculate size: approximate UTF-8 size (most chars are 1 byte, some are 2-4)
-      // Using length * 1.5 as approximation for mixed content
-      const size = Math.ceil(valueString.length * 1.5);
-      const tags = options?.tags ? options.tags.join(',') : null;
-
-      // Check cache size and evict if needed
-      await this.evictIfNeeded(size);
-
-      const entry: Omit<CacheEntry, 'id' | 'createdAt' | 'updatedAt'> = {
-        key: cacheKey,
-        value: valueString,
-        ttl,
-        tags: tags || undefined,
-        lastAccessedAt: now,
-        size,
-      };
-
-      const id = generateRequestId();
-
-      const query = `
-        INSERT OR REPLACE INTO ${this.cacheTableName}
-        (id, key, value, ttl, tags, created_at, updated_at, last_accessed_at, size)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `;
-
-      await NativeModule.executeSql(query, [
-        id,
-        entry.key,
-        entry.value,
-        entry.ttl,
-        entry.tags || null,
-        now,
-        now,
-        entry.lastAccessedAt,
-        entry.size,
-      ]);
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache set error:', error);
-      }
-      // Don't throw - cache failures shouldn't break the app
-    }
-  }
-
-  /**
-   * Delete cache entry
-   */
-  async delete(key: string): Promise<void> {
-    if (!this.isInitialized) {
-      return;
-    }
-
-    try {
-      const cacheKey = key.includes(':') ? key : this.generateCacheKey(key);
-      const query = `DELETE FROM ${this.cacheTableName} WHERE key = ?`;
-      await NativeModule.executeSql(query, [cacheKey]);
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache delete error:', error);
-      }
-    }
-  }
-
-  /**
-   * Invalidate cache by tags
-   */
-  async invalidateByTags(tags: string[]): Promise<void> {
-    if (!this.isInitialized) {
-      return;
-    }
-
-    try {
-      // Delete entries that have any of the specified tags
-      const tagConditions = tags.map(() => 'tags LIKE ?').join(' OR ');
-      const tagParams = tags.map(tag => `%${tag}%`);
-
-      const query = `DELETE FROM ${this.cacheTableName} WHERE ${tagConditions}`;
-      await NativeModule.executeSql(query, tagParams);
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache invalidate by tags error:', error);
-      }
-    }
-  }
-
-  /**
-   * Clear all cache
-   */
-  async clear(): Promise<void> {
-    if (!this.isInitialized) {
-      return;
-    }
-
-    try {
-      const query = `DELETE FROM ${this.cacheTableName}`;
-      await NativeModule.executeSql(query, []);
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache clear error:', error);
-      }
-    }
-  }
-
-  /**
-   * Get cache size
-   */
-  async getSize(): Promise<number> {
-    if (!this.isInitialized) {
-      return 0;
-    }
-
-    try {
-      const query = `SELECT SUM(size) as total_size FROM ${this.cacheTableName}`;
-      const results = await NativeModule.executeSql(query, []);
-      return results?.[0]?.total_size || 0;
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache get size error:', error);
-      }
-      return 0;
-    }
-  }
-
-  /**
-   * Evict expired entries
-   */
-  async evictExpired(): Promise<number> {
-    if (!this.isInitialized) {
-      return 0;
-    }
-
-    try {
-      const now = Date.now();
-      const query = `DELETE FROM ${this.cacheTableName} WHERE ttl < ?`;
-      const result = await NativeModule.executeSql(query, [now]);
-      return result?.changes || 0;
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache evict expired error:', error);
-      }
-      return 0;
-    }
-  }
-
-  /**
-   * Evict entries if cache size exceeds limit (LRU)
-   */
-  private async evictIfNeeded(newEntrySize: number): Promise<void> {
-    const currentSize = await this.getSize();
-    const maxSize = this.config.maxSize!;
-
-    if (currentSize + newEntrySize <= maxSize) {
-      return;
-    }
-
-    // Evict expired entries first
-    await this.evictExpired();
-
-    // If still over limit, evict least recently used
-    const remainingSize = await this.getSize();
-    if (remainingSize + newEntrySize > maxSize) {
-      const toEvict = remainingSize + newEntrySize - maxSize;
-      await this.evictLRU(toEvict);
-    }
-  }
-
-  /**
-   * Evict least recently used entries
-   */
-  private async evictLRU(targetSize: number): Promise<void> {
-    try {
-      // Get entries sorted by last accessed, oldest first
-      const query = `
-        SELECT id, size FROM ${this.cacheTableName}
-        ORDER BY last_accessed_at ASC
-      `;
-      const results = await NativeModule.executeSql(query, []);
-
-      let evictedSize = 0;
-      const idsToDelete: string[] = [];
-
-      for (const row of results || []) {
-        if (evictedSize >= targetSize) {
-          break;
-        }
-        idsToDelete.push(row.id);
-        evictedSize += row.size || 0;
-      }
-
-      if (idsToDelete.length > 0) {
-        const placeholders = idsToDelete.map(() => '?').join(',');
-        const deleteQuery = `DELETE FROM ${this.cacheTableName} WHERE id IN (${placeholders})`;
-        await NativeModule.executeSql(deleteQuery, idsToDelete);
-      }
-    } catch (error) {
-      if (__DEV__) {
-        console.error('Cache evict LRU error:', error);
-      }
-    }
-  }
-
-  /**
-   * Update last accessed time
-   */
-  private async updateLastAccessed(key: string, timestamp: number): Promise<void> {
-    try {
-      const query = `
-        UPDATE ${this.cacheTableName}
-        SET last_accessed_at = ?
-        WHERE key = ?
-      `;
-      await NativeModule.executeSql(query, [timestamp, key]);
-    } catch (error) {
-      // Non-critical error, don't throw
-      if (__DEV__) {
-        console.warn('Failed to update last accessed:', error);
-      }
-    }
-  }
-
-  /**
-   * Parse cache entry from database row
-   */
-  private parseCacheEntry(row: any): CacheEntry {
-    return {
-      id: row.id,
-      key: row.key,
-      value: row.value,
-      ttl: row.ttl,
-      tags: row.tags,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      lastAccessedAt: row.last_accessed_at,
-      size: row.size,
+  async fetch<T>(key: string, fetcher: () => Promise<T>, options: FetchOptions = {}): Promise<FetchResult<T>> {
+    const strategy = options.strategy ?? this.getEndpointStrategy(options.endpoint ?? key)?.strategy ?? this.config.strategy ?? 'network-first';
+    const fromNetwork = async (): Promise<FetchResult<T>> => {
+      const data = await fetcher();
+      await this.set(key, data, options);
+      return { data, fromCache: false, stale: false };
     };
+    const cachedOrThrow = async (error: unknown): Promise<FetchResult<T>> => {
+      const entry = await SyncVault.cache.get<StoredValue<T>>(key);
+      if (entry?.value && typeof entry.value === 'object') {
+        return { data: entry.value.data, fromCache: true, stale: Date.now() > entry.value.freshUntil };
+      }
+      throw error;
+    };
+
+    if (strategy === 'network-first' || !this.isEnabled()) {
+      try {
+        return await fromNetwork();
+      } catch (error) {
+        return cachedOrThrow(error);
+      }
+    }
+
+    const cached = await this.get<T>(key, options.endpoint);
+    if (strategy === 'cache-first') {
+      if (cached.hit && !cached.stale) return { data: cached.data as T, fromCache: true, stale: false };
+      try {
+        return await fromNetwork();
+      } catch (error) {
+        return cachedOrThrow(error);
+      }
+    }
+
+    // stale-while-revalidate
+    if (cached.hit) {
+      if (cached.stale) void fromNetwork().catch(() => undefined);
+      return { data: cached.data as T, fromCache: true, stale: !!cached.stale };
+    }
+    return fromNetwork();
   }
 
-  /**
-   * Check if cache is enabled
-   */
-  isEnabled(): boolean {
-    return this.config.enabled === true && this.isInitialized;
+  async delete(key: string): Promise<void> {
+    await SyncVault.cache.delete(key);
   }
 
-  /**
-   * Get cache configuration
-   */
-  getConfig(): CacheConfig {
-    return { ...this.config };
+  /** Invalidates by exact path, '*' / '**' / ':param' pattern, or URL prefix. */
+  async invalidate(pattern: string): Promise<number> {
+    const wildcard = pattern.search(/[*:]/);
+    if (wildcard === -1) {
+      return SyncVault.cache.invalidate({ tags: [pathTag(pattern)] });
+    }
+    // Native invalidation is prefix/tag based; the pattern's literal head is the prefix.
+    return SyncVault.cache.invalidate({ prefix: pattern.slice(0, wildcard) });
+  }
+
+  async invalidateByTags(tags: string[]): Promise<number> {
+    return SyncVault.cache.invalidate({ tags });
+  }
+
+  /** Applies `invalidateOnMutate` rules, e.g. { 'POST /api/todos': ['/api/todos'] }. */
+  async invalidateOnMutate(method: string, url: string): Promise<void> {
+    const rules = this.config.invalidateOnMutate ?? {};
+    const path = url.replace(/^[a-z]+:\/\/[^/]+/i, '');
+    const targets = new Set<string>();
+    for (const [rule, patterns] of Object.entries(rules)) {
+      const space = rule.indexOf(' ');
+      const ruleMethod = space === -1 ? '*' : rule.slice(0, space).toUpperCase();
+      const rulePattern = space === -1 ? rule : rule.slice(space + 1);
+      if (ruleMethod !== '*' && ruleMethod !== method.toUpperCase()) continue;
+      if (patternToRegExp(rulePattern).test(path) || patternToRegExp(rulePattern).test(url)) {
+        patterns.forEach((p) => targets.add(p));
+      }
+    }
+    await Promise.all(Array.from(targets).map((p) => this.invalidate(p)));
+  }
+
+  async clear(): Promise<void> {
+    await SyncVault.cache.clear();
+  }
+
+  async getSize(): Promise<number> {
+    return (await SyncVault.cache.stats()).sizeBytes;
+  }
+
+  async stats() {
+    return SyncVault.cache.stats();
+  }
+
+  /** Removes expired entries and least-recently-used entries above maxSize. */
+  async enforceMaxSize(): Promise<number> {
+    return SyncVault.cache.evict(this.config.maxSize ?? DEFAULT_MAX_SIZE);
   }
 }
 
-export default CacheManager;
+let shared: CacheManager | null = null;
 
+/** Process-wide cache used by hooks and interceptors. */
+export function getCacheManager(): CacheManager {
+  if (!shared) shared = new CacheManager();
+  return shared;
+}
+
+export function configureCache(config: CacheConfig): CacheManager {
+  getCacheManager().configure(config);
+  return getCacheManager();
+}
+
+export default CacheManager;

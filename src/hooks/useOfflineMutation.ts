@@ -1,148 +1,70 @@
-import { useState, useCallback, useEffect } from 'react';
-import { useOfflineQueue } from './useOfflineQueue';
-import { useSmartCache } from './useSmartCache';
-import SmartCacheManager from '../cache/SmartCacheManager';
-import { OfflineQueueConfig } from '../types';
+import { useCallback, useRef, useState } from 'react';
+import { SyncVault } from '../core/SyncVault';
+import type { EnqueueOptions } from '../core/types';
+import { getCacheManager } from '../cache/CacheManager';
 
-/**
- * Mutation options
- */
-export interface UseOfflineMutationOptions<TData = any, TVariables = any> {
-  fn: (variables: TVariables) => Promise<Response>;
-  invalidateOnSuccess?: string[]; // Cache keys to invalidate on success
-  onSuccess?: (data: TData) => void;
-  onError?: (error: Error) => void;
+export interface UseOfflineMutationOptions<TVariables> {
+  /** Maps variables to the request to queue. */
+  request: (variables: TVariables) => EnqueueOptions;
+  /** Cache paths or patterns to invalidate once the request is queued. */
+  invalidate?: string[];
+  /** Apply local state changes immediately; the request is durable from this point. */
+  onQueued?: (requestId: string, variables: TVariables) => void;
+  onError?: (error: Error, variables: TVariables) => void;
 }
 
-/**
- * Mutation result
- */
-export interface UseOfflineMutationResult<TData = any, TVariables = any> {
-  mutate: (variables: TVariables) => Promise<void>;
-  mutateAsync: (variables: TVariables) => Promise<TData>;
+export interface UseOfflineMutationResult<TVariables> {
+  /** Resolves with the request id once the request is durably queued. */
+  mutate: (variables: TVariables) => Promise<string>;
   isPending: boolean;
   error: Error | null;
+  lastRequestId: string | null;
   reset: () => void;
 }
 
 /**
- * Offline Mutation Hook
- * React Query-like mutation hook powered by sync vault queue
+ * Offline-first mutation: the request is committed to the native outbox and delivered with
+ * retries, ordering, and idempotency, even if the app is killed. Track delivery of
+ * `lastRequestId` with useRequestStatus().
  */
-export function useOfflineMutation<TData = any, TVariables = any>(
-  options: UseOfflineMutationOptions<TData, TVariables>
-): UseOfflineMutationResult<TData, TVariables> {
-  const { fn, invalidateOnSuccess = [], onSuccess, onError } = options;
-
-  const [config] = useState<OfflineQueueConfig>(() => ({
-    cache: {
-      enabled: true,
-      invalidateOnMutate: {},
-    },
-  }));
-
-  const queue = useOfflineQueue(config);
-  const [cacheManager, setCacheManager] = useState<SmartCacheManager | null>(null);
+export function useOfflineMutation<TVariables = void>(
+  options: UseOfflineMutationOptions<TVariables>
+): UseOfflineMutationResult<TVariables> {
   const [isPending, setIsPending] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [lastRequestId, setLastRequestId] = useState<string | null>(null);
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
 
-  // Get cache manager instance
-  useEffect(() => {
-    const SmartCacheManagerClass = require('../cache/SmartCacheManager').default;
-    if (SmartCacheManagerClass && !cacheManager) {
-      const manager = new SmartCacheManagerClass(config.cache);
-      manager.initialize().then(() => {
-        setCacheManager(manager);
-      }).catch(() => {
-        // Ignore initialization errors
-      });
+  const mutate = useCallback(async (variables: TVariables) => {
+    const { request, invalidate = [], onQueued, onError } = optionsRef.current;
+    setIsPending(true);
+    setError(null);
+    try {
+      const enqueue = request(variables);
+      const id = await SyncVault.enqueue(enqueue);
+      setLastRequestId(id);
+      onQueued?.(id, variables);
+      const cache = getCacheManager();
+      await Promise.all([
+        ...invalidate.map((pattern) => cache.invalidate(pattern)),
+        cache.invalidateOnMutate(enqueue.method, enqueue.url),
+      ]).catch(() => undefined);
+      return id;
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      setError(err);
+      onError?.(err, variables);
+      throw err;
+    } finally {
+      setIsPending(false);
     }
-  }, [config, cacheManager]);
-
-  const cache = useSmartCache(cacheManager);
-
-  const mutate = useCallback(
-    async (variables: TVariables) => {
-      setIsPending(true);
-      setError(null);
-
-      try {
-        // Extract URL from function (would need to parse or pass separately)
-        // For now, assume fn returns a Response with URL info
-        const response = await fn(variables);
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        const data = await response.json();
-
-        // Invalidate cache if configured
-        if (invalidateOnSuccess.length > 0 && cacheManager) {
-          await Promise.all(
-            invalidateOnSuccess.map((key) => cache.invalidateOnMutate('POST', key))
-          );
-        }
-
-        onSuccess?.(data);
-        setIsPending(false);
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        setError(error);
-        setIsPending(false);
-        onError?.(error);
-        throw error;
-      }
-    },
-    [fn, invalidateOnSuccess, cache, cacheManager, onSuccess, onError]
-  );
-
-  const mutateAsync = useCallback(
-    async (variables: TVariables): Promise<TData> => {
-      setIsPending(true);
-      setError(null);
-
-      try {
-        const response = await fn(variables);
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        const data = await response.json();
-
-        // Invalidate cache if configured
-        if (invalidateOnSuccess.length > 0 && cacheManager) {
-          await Promise.all(
-            invalidateOnSuccess.map((key) => cache.invalidateOnMutate('POST', key))
-          );
-        }
-
-        onSuccess?.(data);
-        setIsPending(false);
-        return data;
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        setError(error);
-        setIsPending(false);
-        onError?.(error);
-        throw error;
-      }
-    },
-    [fn, invalidateOnSuccess, cache, cacheManager, onSuccess, onError]
-  );
+  }, []);
 
   const reset = useCallback(() => {
     setError(null);
-    setIsPending(false);
+    setLastRequestId(null);
   }, []);
 
-  return {
-    mutate,
-    mutateAsync,
-    isPending,
-    error,
-    reset,
-  };
+  return { mutate, isPending, error, lastRequestId, reset };
 }
-

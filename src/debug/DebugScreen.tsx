@@ -1,315 +1,140 @@
-import React, { useState, useEffect } from 'react';
-import {
-  View,
-  Text,
-  ScrollView,
-  StyleSheet,
-  TouchableOpacity,
-  RefreshControl,
-} from 'react-native';
-import { useQueueStatus } from '../hooks/useQueueStatus';
-import { usePendingRequests } from '../hooks/usePendingRequests';
-import { useFailedRequests } from '../hooks/useFailedRequests';
-import { performanceTracker } from '../utils/performance';
-import { QueueLogger } from './QueueLogger';
+import React, { useEffect, useState } from 'react';
+import { RefreshControl, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import type { SyncRequest } from '../core/types';
+import { useConflicts, useFailedRequests, usePendingRequests } from '../hooks/useRequests';
+import { useSyncStatus } from '../hooks/useSyncStatus';
+import { QueueLogger, type LogEntry } from './QueueLogger';
 
-/**
- * Debug screen component for visualizing queue status
- */
+function RequestRow({ request, actions }: { request: SyncRequest; actions?: React.ReactNode }) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.rowTitle}>
+        {request.method} {request.url}
+      </Text>
+      <Text style={styles.rowMeta}>
+        {request.status} · attempt {request.attempt}/{request.maxAttempts}
+        {request.queueKey ? ` · ${request.queueKey}` : ''}
+        {request.authBlocked ? ' · waiting for auth' : ''}
+      </Text>
+      {request.lastError ? <Text style={styles.rowError}>{request.lastError}</Text> : null}
+      {actions ? <View style={styles.actions}>{actions}</View> : null}
+    </View>
+  );
+}
+
+function Button({ label, onPress }: { label: string; onPress: () => void }) {
+  return (
+    <TouchableOpacity style={styles.button} onPress={onPress} accessibilityRole="button">
+      <Text style={styles.buttonText}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+/** Development screen: queue state, outbox contents, dead letters, conflicts, and event log. */
 export function DebugScreen() {
-  // Use event-based hooks (no polling)
-  const { status, refetch: refetchStatus } = useQueueStatus();
-  const { pendingRequests, refetch: refetchPending } = usePendingRequests(20);
-  const { failedRequests, refetch: refetchFailed, retry } = useFailedRequests();
-  const [metrics, setMetrics] = useState<any>(null);
-  const [logs, setLogs] = useState<any[]>([]);
+  const status = useSyncStatus();
+  const pending = usePendingRequests(50);
+  const failed = useFailedRequests(50);
+  const conflicts = useConflicts(50);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
-    loadMetrics();
-    loadLogs();
-  }, []);
-
-  const loadMetrics = async () => {
-    try {
-      const perfMetrics = await performanceTracker.getMetrics();
-      setMetrics(perfMetrics);
-    } catch (error) {
-      console.error('Failed to load metrics:', error);
-    }
-  };
-
-  const loadLogs = () => {
-    const recentLogs = QueueLogger.getLogs().slice(-50);
-    setLogs(recentLogs);
-  };
+    QueueLogger.start();
+    setLogs(QueueLogger.getLogs().slice(-50));
+  }, [status.version]);
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([
-      refetchStatus(),
-      refetchPending(),
-      refetchFailed(),
-      loadMetrics(),
-      loadLogs(),
-    ]);
+    await Promise.all([pending.refresh(), failed.refresh(), conflicts.refresh()]);
     setRefreshing(false);
   };
 
-  const handleRetry = async (requestId: string) => {
-    await retry(requestId);
-    await refetchFailed();
-    await refetchPending();
-  };
-
+  const { counts } = status;
   return (
-    <ScrollView
-      style={styles.container}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-      }
-    >
+    <ScrollView style={styles.container} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}>
       <View style={styles.section}>
-        <Text style={styles.title}>Queue Status</Text>
-        {status && (
-          <View style={styles.statusGrid}>
-            <View style={styles.statusItem}>
-              <Text style={styles.statusLabel}>Network</Text>
-              <Text
-                style={[
-                  styles.statusValue,
-                  status.networkStatus === 'online'
-                    ? styles.online
-                    : styles.offline,
-                ]}
-              >
-                {status.networkStatus}
-              </Text>
-            </View>
-            <View style={styles.statusItem}>
-              <Text style={styles.statusLabel}>Pending</Text>
-              <Text style={styles.statusValue}>{status.totalPending}</Text>
-            </View>
-            <View style={styles.statusItem}>
-              <Text style={styles.statusLabel}>Failed</Text>
-              <Text style={styles.statusValue}>{status.totalFailed}</Text>
-            </View>
-            <View style={styles.statusItem}>
-              <Text style={styles.statusLabel}>Syncing</Text>
-              <Text style={styles.statusValue}>
-                {status.syncInProgress ? 'Yes' : 'No'}
-              </Text>
-            </View>
-            <View style={styles.statusItem}>
-              <Text style={styles.statusLabel}>Total Synced</Text>
-              <Text style={styles.statusValue}>{status.totalSynced || 0}</Text>
-            </View>
-          </View>
-        )}
-      </View>
-
-      {metrics && (
-        <View style={styles.section}>
-          <Text style={styles.title}>Performance Metrics</Text>
-          <View style={styles.metricsList}>
-            <Text style={styles.metricItem}>
-              Init Time: {metrics.initializationTime?.toFixed(2)}ms
-            </Text>
-            <Text style={styles.metricItem}>
-              Avg Enqueue: {metrics.averageEnqueueTime?.toFixed(2)}ms
-            </Text>
-            <Text style={styles.metricItem}>
-              Avg Sync: {metrics.averageSyncTime?.toFixed(2)}ms
-            </Text>
-            <Text style={styles.metricItem}>
-              Memory: {metrics.memoryOverhead?.toFixed(2)}KB
-            </Text>
-          </View>
+        <Text style={styles.title}>Status</Text>
+        <Text style={styles.line}>
+          Network: {status.isOnline ? 'online' : 'offline'} ({status.network.type})
+          {status.network.isExpensive ? ', metered' : ''}
+        </Text>
+        <Text style={styles.line}>Draining: {status.isDraining ? 'yes' : 'no'}</Text>
+        <Text style={styles.line}>
+          Pending {counts.pending} · In flight {counts.inflight} · Conflicts {counts.conflict} · Dead letters {counts.deadLetter} ·
+          Auth blocked {counts.authBlocked}
+        </Text>
+        <View style={styles.actions}>
+          <Button label="Drain now" onPress={status.drainNow} />
+          <Button label="Retry all failed" onPress={() => void status.retryAllDeadLetters()} />
         </View>
-      )}
+      </View>
 
       <View style={styles.section}>
-        <Text style={styles.title}>Pending Requests ({pendingRequests.length})</Text>
-        {pendingRequests.map((request) => (
-          <View key={request.id} style={styles.requestItem}>
-            <Text style={styles.requestMethod}>{request.method}</Text>
-            <Text style={styles.requestUrl}>{request.url}</Text>
-            <Text style={styles.requestStatus}>Status: {request.status}</Text>
-            <Text style={styles.requestPriority}>Priority: {request.priority}</Text>
-          </View>
+        <Text style={styles.title}>Pending ({pending.requests.length})</Text>
+        {pending.requests.map((r) => (
+          <RequestRow key={r.id} request={r} />
         ))}
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.title}>Failed Requests ({failedRequests.length})</Text>
-        {failedRequests.map((request: any) => (
-          <View key={request.id} style={styles.requestItem}>
-            <Text style={styles.requestMethod}>{request.method}</Text>
-            <Text style={styles.requestUrl}>{request.url}</Text>
-            <Text style={styles.errorMessage}>
-              Error: {request.errorMessage}
-            </Text>
-            <Text style={styles.failureType}>
-              Type: {request.failureType}
-            </Text>
-            {request.willRetry && (
-              <TouchableOpacity
-                style={styles.retryButton}
-                onPress={() => handleRetry(request.requestId)}
-              >
-                <Text style={styles.retryButtonText}>Retry</Text>
-              </TouchableOpacity>
-            )}
-          </View>
+        <Text style={styles.title}>Dead letters ({failed.requests.length})</Text>
+        {failed.requests.map((r) => (
+          <RequestRow
+            key={r.id}
+            request={r}
+            actions={
+              <>
+                <Button label="Retry" onPress={() => void failed.retry(r.id)} />
+                <Button label="Discard" onPress={() => void failed.discard(r.id)} />
+              </>
+            }
+          />
         ))}
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.title}>Recent Logs ({logs.length})</Text>
-        {logs.slice(-20).map((log, index) => (
-          <View key={index} style={styles.logItem}>
-            <Text style={styles.logLevel}>{log.level}</Text>
-            <Text style={styles.logMessage}>{log.message}</Text>
-            <Text style={styles.logTime}>
-              {new Date(log.timestamp).toLocaleTimeString()}
-            </Text>
-          </View>
+        <Text style={styles.title}>Conflicts ({conflicts.requests.length})</Text>
+        {conflicts.requests.map((r) => (
+          <RequestRow
+            key={r.id}
+            request={r}
+            actions={
+              <>
+                <Button label="Keep local" onPress={() => void conflicts.resolve(r.id, { action: 'keep_local' })} />
+                <Button label="Keep server" onPress={() => void conflicts.resolve(r.id, { action: 'keep_server' })} />
+              </>
+            }
+          />
         ))}
+      </View>
+
+      <View style={styles.section}>
+        <Text style={styles.title}>Events</Text>
+        {logs
+          .slice()
+          .reverse()
+          .map((log, i) => (
+            <Text key={`${log.timestamp}-${i}`} style={[styles.log, log.level === 'error' && styles.rowError]}>
+              {new Date(log.timestamp).toLocaleTimeString()} {log.message}
+            </Text>
+          ))}
       </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
-  },
-  section: {
-    backgroundColor: '#fff',
-    margin: 10,
-    padding: 15,
-    borderRadius: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  title: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 10,
-    color: '#333',
-  },
-  statusGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-  },
-  statusItem: {
-    width: '48%',
-    marginBottom: 10,
-  },
-  statusLabel: {
-    fontSize: 12,
-    color: '#666',
-    marginBottom: 4,
-  },
-  statusValue: {
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  online: {
-    color: '#4CAF50',
-  },
-  offline: {
-    color: '#F44336',
-  },
-  metricsList: {
-    marginTop: 10,
-  },
-  metricItem: {
-    fontSize: 14,
-    color: '#666',
-    marginBottom: 5,
-  },
-  requestItem: {
-    borderLeftWidth: 3,
-    borderLeftColor: '#2196F3',
-    paddingLeft: 10,
-    marginBottom: 15,
-    paddingBottom: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-  },
-  requestMethod: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    color: '#2196F3',
-    marginBottom: 4,
-  },
-  requestUrl: {
-    fontSize: 14,
-    color: '#333',
-    marginBottom: 4,
-  },
-  requestStatus: {
-    fontSize: 12,
-    color: '#666',
-    marginBottom: 2,
-  },
-  requestPriority: {
-    fontSize: 12,
-    color: '#666',
-  },
-  errorMessage: {
-    fontSize: 12,
-    color: '#F44336',
-    marginTop: 4,
-    marginBottom: 2,
-  },
-  failureType: {
-    fontSize: 12,
-    color: '#666',
-    marginBottom: 8,
-  },
-  retryButton: {
-    backgroundColor: '#4CAF50',
-    padding: 8,
-    borderRadius: 4,
-    alignSelf: 'flex-start',
-    marginTop: 5,
-  },
-  retryButtonText: {
-    color: '#fff',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  logItem: {
-    flexDirection: 'row',
-    marginBottom: 8,
-    paddingBottom: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-  },
-  logLevel: {
-    fontSize: 10,
-    fontWeight: 'bold',
-    width: 50,
-    textTransform: 'uppercase',
-  },
-  logMessage: {
-    flex: 1,
-    fontSize: 12,
-    color: '#666',
-    marginLeft: 10,
-  },
-  logTime: {
-    fontSize: 10,
-    color: '#999',
-    marginLeft: 10,
-  },
+  container: { flex: 1, backgroundColor: '#fafafa' },
+  section: { padding: 16, borderBottomWidth: 1, borderBottomColor: '#eee' },
+  title: { fontSize: 16, fontWeight: '600', marginBottom: 8 },
+  line: { fontSize: 13, color: '#333', marginBottom: 4 },
+  row: { paddingVertical: 8, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: '#ddd' },
+  rowTitle: { fontSize: 13, fontWeight: '500' },
+  rowMeta: { fontSize: 12, color: '#666' },
+  rowError: { fontSize: 12, color: '#c62828' },
+  actions: { flexDirection: 'row', marginTop: 6 },
+  button: { backgroundColor: '#1976d2', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 4, marginRight: 8 },
+  buttonText: { color: '#fff', fontSize: 12 },
+  log: { fontSize: 11, fontFamily: 'Courier', color: '#444' },
 });
-
-

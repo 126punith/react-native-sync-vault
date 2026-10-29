@@ -1,0 +1,26 @@
+{
+  "name": "express-sync-vault",
+  "version": "2.0.0",
+  "description": "Express middleware implementing the react-native-sync-vault backend contract: Idempotency-Key replay, If-Match concurrency, Retry-After, and batch sync.",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "express": ">=4.17"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    },
+    "redis": {
+      "optional": true
+    }
+  }
+}

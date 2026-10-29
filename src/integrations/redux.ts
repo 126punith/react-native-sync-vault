@@ -1,63 +1,42 @@
-import { OfflineQueueConfig } from '../types';
+import { SyncVault } from '../core/SyncVault';
+import type { EnqueueOptions, SyncEvent } from '../core/types';
 
-// Types for Redux (optional dependency)
-type Middleware = any;
+type Action = { type: string; meta?: { syncVault?: EnqueueOptions } & Record<string, unknown> } & Record<string, unknown>;
+type Dispatch = (action: Action) => unknown;
+type MiddlewareApi = { dispatch: Dispatch; getState: () => unknown };
+
+export const SYNC_VAULT_EVENT = 'syncVault/event';
+
+export interface SyncVaultMiddlewareOptions {
+  /** Dispatch `{ type: 'syncVault/event', payload }` for engine events. Default true. */
+  dispatchEvents?: boolean;
+}
 
 /**
- * Redux Middleware for Sync Vault
- * Queues actions that trigger API calls when offline
+ * Actions carrying `meta.syncVault` (EnqueueOptions) are passed to reducers (optimistic update)
+ * and their request is queued; `${type}/queued` is dispatched with the request id.
  */
-export function createSyncVaultMiddleware(
-  config: OfflineQueueConfig
-): Middleware {
-  // Dynamically import QueueManager
-  const QueueManagerClass = require('../QueueManager').default;
-  const queueManager = new QueueManagerClass();
-
-  return (store: any) => (next: any) => (action: any) => {
-    // Check if action should be queued
-    // This is a simplified version - in production, you would:
-    // 1. Check action metadata for API call info
-    // 2. Queue the API call if offline
-    // 3. Dispatch success/failure actions when synced
-
-    const result = next(action);
-
-    // If action has API call metadata, queue it
-    if (action.meta?.apiCall && action.meta?.queueIfOffline) {
-      const { method, url, data } = action.meta.apiCall;
-
-      queueManager
-        .push({
-          method,
-          url,
-          data,
-        })
-        .catch((err: any) => {
-          if (__DEV__) {
-            console.error('Failed to queue action:', err);
-          }
-        });
+export function createSyncVaultMiddleware(options: SyncVaultMiddlewareOptions = {}) {
+  return (api: MiddlewareApi) => {
+    if (options.dispatchEvents !== false) {
+      SyncVault.addEventListener((event: SyncEvent) => api.dispatch({ type: SYNC_VAULT_EVENT, payload: event }));
     }
-
-    return result;
+    return (next: Dispatch) => (action: Action) => {
+      const result = next(action);
+      const request = action?.meta?.syncVault;
+      if (request) {
+        SyncVault.enqueue(request).then(
+          (requestId) => api.dispatch({ type: `${action.type}/queued`, payload: { requestId } }),
+          (error: unknown) =>
+            api.dispatch({ type: `${action.type}/queueFailed`, payload: { error: error instanceof Error ? error.message : String(error) } })
+        );
+      }
+      return result;
+    };
   };
 }
 
-/**
- * Redux Integration Helper
- * Sets up Redux with sync vault middleware
- */
-export function withSyncVault(
-  reducer: any,
-  config: OfflineQueueConfig
-): {
-  reducer: any;
-  middleware: Middleware[];
-} {
-  return {
-    reducer,
-    middleware: [createSyncVaultMiddleware(config)],
-  };
+/** @deprecated Use createSyncVaultMiddleware(). */
+export function withSyncVault<R>(reducer: R, options?: SyncVaultMiddlewareOptions) {
+  return { reducer, middleware: [createSyncVaultMiddleware(options)] };
 }
-
